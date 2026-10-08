@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt, clippy and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # The backends are separate crates in sibling directories; tiny-rca's
+      # integration test drives the real binaries, so it needs release builds of
+      # both. Checkout them alongside.
+      - name: Check out tiny-pdg-cs
+        uses: actions/checkout@v4
+        with:
+          repository: steetstyle/tinypdg-cs
+          path: tiny-pdg-cs
+
+      - name: Check out tinylink
+        uses: actions/checkout@v4
+        with:
+          repository: steetstyle/tinylink
+          path: tinylink
+
+      - name: Build tiny-pdg-cs
+        working-directory: tiny-pdg-cs
+        run: cargo build --release --features mcp
+
+      - name: Build tinylink
+        working-directory: tinylink
+        run: cargo build --release --features mcp
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
