@@ -16,11 +16,56 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use rmcp::service::RunningService;
+use rmcp::ErrorData as McpError;
+use rmcp::service::{NotificationContext, RequestContext, RunningService, Service, ServiceRole};
 use rmcp::ServiceExt;
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::RwLock;
+
+/// Pins the protocol version this client proposes in `initialize`.
+///
+/// The reason this exists is a genuine cross-SDK mismatch. This client sends whatever
+/// its SDK considers latest — `2026-07-28` on rmcp 3.5 — while `ModelContextProtocol`
+/// 2.2.0 on the .NET side supports up to `2025-11-25`. The .NET server does not
+/// negotiate down: an unrecognised version fails the handshake outright, with
+///
+/// ```text
+/// UnsupportedProtocolVersionException: Protocol version '2026-07-28' is not
+/// available through the initialize handshake.
+/// ```
+///
+/// so a .NET MCP server cannot be reached at all, however it is addressed. Proposing
+/// `LATEST_WITH_INITIALIZE` costs nothing: the Rust SDK implements it, and negotiating
+/// down is what the spec's version field is for.
+///
+/// Raise this when the .NET SDK catches up. Nothing here is specific to the telemetry
+/// server — it applies to every .NET MCP server, and this repo has seven of them.
+struct PinnedVersion<S>(S);
+
+impl<S: Service<rmcp::RoleClient>> Service<rmcp::RoleClient> for PinnedVersion<S> {
+    async fn handle_request(
+        &self,
+        request: <rmcp::RoleClient as ServiceRole>::PeerReq,
+        context: RequestContext<rmcp::RoleClient>,
+    ) -> Result<<rmcp::RoleClient as ServiceRole>::Resp, McpError> {
+        self.0.handle_request(request, context).await
+    }
+
+    async fn handle_notification(
+        &self,
+        notification: <rmcp::RoleClient as ServiceRole>::PeerNot,
+        context: NotificationContext<rmcp::RoleClient>,
+    ) -> Result<(), McpError> {
+        self.0.handle_notification(notification, context).await
+    }
+
+    fn get_info(&self) -> <rmcp::RoleClient as ServiceRole>::Info {
+        self.0
+            .get_info()
+            .with_protocol_version(rmcp::model::ProtocolVersion::LATEST_WITH_INITIALIZE)
+    }
+}
 
 /// How to reach one backend server.
 #[derive(Debug, Clone)]
@@ -29,6 +74,14 @@ pub enum Endpoint {
     Stdio {
         binary: std::path::PathBuf,
         args: Vec<String>,
+        /// Extra environment for the child.
+        ///
+        /// The telemetry server needs two variables set to start in stdio mode at all:
+        /// it refuses to come up as a child process with authentication required,
+        /// because there is no client to present a token. Passing them here rather than
+        /// expecting the caller to export them means `--telemetry <dll>` works on its
+        /// own.
+        env: Vec<(String, String)>,
     },
     /// Connect to a Streamable HTTP endpoint.
     ///
@@ -44,7 +97,7 @@ pub struct McpLink {
     /// Tool names the server advertises, so a tool can check the target
     /// actually has it before calling.
     tools: Vec<String>,
-    service: RunningService<rmcp::RoleClient, ()>,
+    service: RunningService<rmcp::RoleClient, PinnedVersion<()>>,
 }
 
 impl McpLink {
@@ -54,24 +107,55 @@ impl McpLink {
     /// so each arm does its own handshake and they agree on the result.
     pub async fn connect(name: &str, endpoint: Endpoint) -> anyhow::Result<Self> {
         let (service, tool_list) = match &endpoint {
-            Endpoint::Stdio { binary, args } => {
+            Endpoint::Stdio { binary, args, env } => {
+                // Only check the filesystem when the argument looks like a path. A bare
+                // name — "dotnet", for the telemetry server, which is a .NET assembly and
+                // so is launched as `dotnet <dll>` — is a command for the OS to resolve on
+                // PATH, and checking Path::exists on it looks in the working directory
+                // and reports a perfectly good command as missing.
+                let looks_like_path = binary.components().count() > 1;
                 anyhow::ensure!(
-                    binary.exists(),
+                    !looks_like_path || binary.exists(),
                     "{} server binary not found at {}. Build it first, e.g. \
                      `cargo build --release --features mcp` in that project, or pass its path.",
                     name,
                     binary.display()
                 );
+                // Inherit the parent's telemetry connection settings — where the database
+                // is, which provider — and set only what is specific to being launched
+                // this way. The telemetry server refuses to start as a child process with
+                // authentication required, because there is no client to present a token.
                 let mut cmd = Command::new(binary);
+                for (key, value) in env {
+                    cmd.env(key, value);
+                }
                 cmd.args(args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    // The child's stderr is not part of the protocol; discard it so a
-                    // chatty server cannot fill a pipe and block.
-                    .stderr(Stdio::null())
-                    .kill_on_drop(true);
-                let transport = rmcp::transport::TokioChildProcess::new(cmd)
+                    .env("TELEMETRY_MCP_TRANSPORT", "stdio")
+                    .env("TELEMETRY_MCP_AUTH", "disabled");
+
+                // The child's stderr is not part of the protocol, but it is drained into
+                // the log rather than discarded. Discarding it protects against a chatty
+                // server filling a pipe and blocking, and draining protects against the
+                // same thing — so draining costs nothing, and it means a backend that
+                // refuses to start says why instead of merely being reported missing.
+                let (transport, stderr) = rmcp::transport::TokioChildProcess::builder(cmd)
+                    .stderr(Stdio::piped())
+                    .spawn()
                     .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", binary.display()))?;
+
+                if let Some(stderr) = stderr {
+                    // Owned, because the drain outlives this function and `name` is a
+                    // borrow of the caller's.
+                    let tag = name.to_string();
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncBufReadExt;
+                        let mut lines = tokio::io::BufReader::new(stderr).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            tracing::warn!("[{tag}] {line}");
+                        }
+                    });
+                }
+
                 handshake(transport, name, &endpoint).await?
             }
             Endpoint::Http { url } => {
@@ -105,6 +189,7 @@ impl McpLink {
             Endpoint::Stdio {
                 binary: binary.to_path_buf(),
                 args: args.to_vec(),
+                env: Vec::new(),
             },
         )
         .await
@@ -163,8 +248,18 @@ impl McpLink {
             return Err(format!("{} server reported: {}", self.name, text));
         }
 
-        serde_json::from_str(&text)
-            .map_err(|e| format!("{} server returned non-JSON from '{tool}': {e}", self.name))
+        // The text goes into the message. "expected value at line 1 column 1" says
+        // nothing about which of two servers produced it or what it said instead, and
+        // a backend returning a different content shape is exactly the case this has to
+        // make diagnosable from the other side.
+        serde_json::from_str(&text).map_err(|e| {
+            let head: String = text.chars().take(200).collect();
+            format!(
+                "{} server returned non-JSON from '{tool}': {e}. First bytes: {}",
+                self.name,
+                if head.is_empty() { "<empty>".to_string() } else { head }
+            )
+        })
     }
 }
 
@@ -177,14 +272,16 @@ async fn handshake<T, E, A>(
     transport: T,
     name: &str,
     endpoint: &Endpoint,
-) -> anyhow::Result<(RunningService<rmcp::RoleClient, ()>, Vec<rmcp::model::Tool>)>
+) -> anyhow::Result<(RunningService<rmcp::RoleClient, PinnedVersion<()>>, Vec<rmcp::model::Tool>)>
 where
     T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
     A: Send + 'static,
 {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        let service = ().serve(transport).await?;
+        // Pinned, so a backend on an older MCP SDK can still be reached; see
+        // PinnedVersion.
+        let service = PinnedVersion(()).serve(transport).await?;
         let tools = service.list_all_tools().await?;
         anyhow::Ok((service, tools))
     })
@@ -201,6 +298,9 @@ pub struct Backends {
     pub link: Option<Arc<McpLink>>,
     /// Static code analysis.
     pub pdg: Option<Arc<McpLink>>,
+    /// The deployment's telemetry database: live traces, logs, and the runtime path
+    /// catalog. Optional, and the only source of paths.
+    pub telemetry: Option<Arc<McpLink>>,
     /// Human-readable notes about servers that could not be started, returned by
     /// tools so the agent knows the view is partial instead of guessing.
     pub unavailable: RwLock<Vec<String>>,
@@ -211,6 +311,7 @@ impl Backends {
         Self {
             link: None,
             pdg: None,
+            telemetry: None,
             unavailable: RwLock::new(Vec::new()),
         }
     }
@@ -227,6 +328,36 @@ impl Backends {
         self.link
             .as_ref()
             .ok_or_else(|| format!("{tool} needs the tinylink server, which is not running"))
+    }
+
+    /// The telemetry server, or a reason it is not there.
+    ///
+    /// The message distinguishes "you did not ask for it" from "you asked and it did
+    /// not come up", because the first is a configuration choice and the second is
+    /// something to fix.
+    pub fn telemetry_required(&self, tool: &str) -> Result<&Arc<McpLink>, String> {
+        self.telemetry.as_ref().ok_or_else(|| {
+            let asked = self
+                .unavailable
+                .try_read()
+                .map(|u| u.iter().any(|n| n.starts_with("telemetry")))
+                .unwrap_or(false);
+            if asked {
+                format!(
+                    "{tool} needs the telemetry server, which was requested but did not \
+                     start. Check its stderr: it reads the telemetry database directly, \
+                     so TELEMETRY_CLICKHOUSE_HOST or TELEMETRY_POSTGRESQL_HOST must \
+                     resolve, and TELEMETRY_MCP_AUTH must be disabled for stdio."
+                )
+            } else {
+                format!(
+                    "{tool} needs the telemetry server, which this instance was not \
+                     started with. Pass --telemetry <dll> or --telemetry-url <url>. It is \
+                     the only source of runtime paths: which branch of the code a request \
+                     took is recorded by the running service, not by a trace capture."
+                )
+            }
+        })
     }
 
     pub fn pdg_required(&self, tool: &str) -> Result<&Arc<McpLink>, String> {

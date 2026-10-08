@@ -344,6 +344,37 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
         })),
     }
 
+    match &backends.telemetry {
+        Some(link) => servers.push(json!({
+            "server": link.name(),
+            "connected": true,
+            "tools": link.tools(),
+            "role": "the deployment's own telemetry database: live traces, logs, baggage, \
+                     and the runtime path catalog",
+            "unique_to_this_server": [
+                "runtime paths: which branch of the code a request actually took, with \
+                 file and line per step. Recorded by the running service's \
+                 instrumentation; a trace capture cannot tell you this.",
+                "path diffs between a failing path and the busiest healthy path for the \
+                 same scope, which is what isolates the code that fails rather than the \
+                 message it fails with.",
+                "baggage scope: whether a set of failures shares a tenant, feature flag \
+                 or region.",
+                "endpoint health over live traffic, with latency percentiles.",
+            ],
+        })),
+        None => servers.push(json!({
+            "server": "telemetry",
+            "connected": false,
+            "role": "the deployment's own telemetry database: live traces, logs, baggage, \
+                     and the runtime path catalog",
+            "not_started_with": "--telemetry <dll> or --telemetry-url <url>",
+            "what_is_missing": "Runtime paths and baggage scope. Which branch of the code \
+                                a request took is recorded by the running service, so \
+                                nothing in a trace capture can reconstruct it.",
+        })),
+    }
+
     // Log support needs the tinylink backend *and* a server new enough to expose
     // the tools. Reporting it as available on the strength of the connection alone
     // would have the agent call a tool that does not exist.
@@ -351,6 +382,10 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
         Some(link) => link.has_tool("search_logs") && link.has_tool("ingest_logs"),
         None => false,
     };
+    let can_search_database_logs = backends
+        .telemetry
+        .as_ref()
+        .is_some_and(|link| link.has_tool("search_logs"));
 
     Ok(json!({
         "servers": servers,
@@ -358,17 +393,44 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
         "can_map_traces_to_code": backends.link.is_some(),
         "can_analyse_code": backends.pdg.is_some(),
         "can_search_logs": can_search_logs,
+        "can_search_database_logs": can_search_database_logs,
+        "can_resolve_runtime_paths": backends.telemetry.is_some(),
         // Said up front because it is the step most likely to be missing: traces
         // arrive per call, but logs have to be loaded once before they can be
         // searched.
-        "log_guidance": if can_search_logs {
-            "Call ingest_logs with an OTLP payload file, or a directory with one payload \
-             per file, before search_logs. An empty store makes every log query return \
-             nothing."
+        // Two log stores, and the difference matters enough to state rather than let an
+        // agent pick one at random.
+        //
+        //   source=store     OTLP payloads you ingested into tinylink. Available with no
+        //                    database, but only covers traffic you captured.
+        //   source=database  the deployment's telemetry database. Every log the service
+        //                    wrote, and — unlike OTLP — the *rendered* message as well as
+        //                    the template, so an interpolated value like a tenant id is
+        //                    findable as text.
+        //
+        // They are not merged: the database has strictly more, and merging would mean
+        // silently preferring whichever answered.
+        "log_sources": {
+            "store": {
+                "available": can_search_logs,
+                "what": "OTLP payloads ingested via ingest_logs, in tinylink's store",
+                "limit": "only the traffic you captured; body is the unrendered template",
+            },
+            "database": {
+                "available": can_search_database_logs,
+                "what": "the telemetry database the running services write to",
+                "limit": "needs the telemetry server; body and rendered message both \
+                          searchable",
+            },
+        },
+        "log_guidance": if can_search_logs || can_search_database_logs {
+            "Pass source=store for captured OTLP payloads, or source=database for the \
+             deployment's own logs. The database is the better source when it is \
+             available: it carries the rendered message, which OTLP does not."
                 .to_string()
         } else {
             "Log search is unavailable: it needs a tinylink server exposing ingest_logs \
-             and search_logs. Rebuild tinylink if it is connected."
+             and search_logs, or a telemetry server."
                 .to_string()
         },
     }))
@@ -397,6 +459,56 @@ mod tests {
         assert!(err.contains("tinylink"), "{err}");
     }
 
+    /// Without the telemetry server, the pass-through has to say how to turn it on and
+    /// what is lost -- not just "unavailable".
+    #[tokio::test]
+    async fn telemetry_call_without_a_backend_says_how_to_start_it() {
+        let backends = Arc::new(Backends::new());
+        let err = telemetry_call(
+            &backends,
+            TelemetryCallArgs {
+                tool: "error_paths".into(),
+                arguments: Default::default(),
+            },
+        )
+        .await
+        .expect_err("no telemetry server, so no paths");
+
+        assert!(err.contains("--telemetry"), "{err}");
+        assert!(
+            err.contains("only source of runtime paths"),
+            "the error has to say what is missing, not just how to fix the flag: {err}"
+        );
+    }
+
+    /// A server that was asked for and did not come up is a different problem from one
+    /// nobody asked for, and the message should not pretend otherwise.
+    #[tokio::test]
+    async fn telemetry_call_distinguishes_not_started_from_failed_to_start() {
+        let backends = Arc::new(Backends::new());
+        backends
+            .note_missing("telemetry (runtime paths, live logs): spawn failed".into())
+            .await;
+        let err = telemetry_call(
+            &backends,
+            TelemetryCallArgs {
+                tool: "error_paths".into(),
+                arguments: Default::default(),
+            },
+        )
+        .await
+        .expect_err("still no server");
+
+        assert!(
+            err.contains("requested but did not start"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("--telemetry <dll>"),
+            "a server that failed to start is not fixed by re-adding the flag: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn capabilities_reports_nothing_connected() {
         let backends = Arc::new(Backends::new());
@@ -404,8 +516,37 @@ mod tests {
         assert_eq!(out["can_map_traces_to_code"], false);
         assert_eq!(out["can_analyse_code"], false);
         let servers = out["servers"].as_array().unwrap();
-        assert_eq!(servers.len(), 2, "{out}");
+        assert_eq!(servers.len(), 3, "{out}");
         assert!(servers.iter().all(|s| s["connected"] == false), "{out}");
+
+        // The telemetry entry has to be present while disconnected, and has to say how
+        // to turn it on. An agent reading capabilities on a bare instance should learn
+        // that runtime paths are missing *and* that nothing it has can replace them.
+        let telemetry = servers
+            .iter()
+            .find(|s| s["server"] == "telemetry")
+            .expect("telemetry entry");
+        assert!(
+            telemetry["not_started_with"]
+                .as_str()
+                .unwrap()
+                .contains("--telemetry"),
+            "{telemetry}"
+        );
+        assert!(
+            telemetry["what_is_missing"]
+                .as_str()
+                .unwrap()
+                .contains("Runtime paths"),
+            "{telemetry}"
+        );
+
+        // Both log sources are reported as unavailable rather than one being silently
+        // preferred, and the database's advantage over OTLP is stated while it is off.
+        assert_eq!(out["log_sources"]["store"]["available"], false, "{out}");
+        assert_eq!(out["log_sources"]["database"]["available"], false, "{out}");
+        assert_eq!(out["can_resolve_runtime_paths"], false, "{out}");
+        assert_eq!(out["can_search_database_logs"], false, "{out}");
     }
 
     #[tokio::test]
@@ -492,14 +633,69 @@ mod tests {
     }
 }
 
+// ───────────────────────── telemetry pass-through ─────────────────────────
+
+/// Arguments for reaching a telemetry-database tool directly.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TelemetryCallArgs {
+    /// Which telemetry tool to call. One of the twelve the server exposes; run
+    /// `capabilities` for the list as the server actually reports it.
+    pub tool: String,
+    /// That tool's own arguments, passed through unchanged.
+    #[serde(default)]
+    pub arguments: serde_json::Map<String, Value>,
+}
+
+/// Call one of the telemetry database's own tools.
+///
+/// A pass-through rather than twelve re-declared tools, on purpose. Mirroring them would
+/// put a second copy of every schema in this repository, and the copy would be wrong the
+/// first time the telemetry server changed a parameter — while still claiming to be
+/// authoritative. A pass-through cannot drift.
+///
+/// All twelve telemetry tools are read-only, so nothing here writes. `find_by_baggage`
+/// looks like it might ingest something; it only queries. Writing telemetry is the
+/// application's job.
+///
+/// The ones worth knowing by name, because they answer questions nothing else can:
+///
+/// - `error_paths` — runtime paths that ended in an exception, with the steps they take
+///   that the busiest healthy path for the same scope does not
+/// - `path_diff` / `path_profile` / `new_paths` — what a path does, how two differ, what
+///   is new since a date
+/// - `find_by_baggage` — which traces carried a tenant or feature flag, and how they fared
+/// - `endpoint_health` — error rate and latency percentiles per route over live traffic
+/// - `capture_coverage` — what is configured to be recorded and when each table last got
+///   a row; call this when anything else returns nothing
+pub async fn telemetry_call(
+    backends: &Arc<Backends>,
+    args: TelemetryCallArgs,
+) -> Result<Value> {
+    let telemetry = backends.telemetry_required(&args.tool)?;
+    if !telemetry.has_tool(&args.tool) {
+        let mut names = telemetry.tools().to_vec();
+        names.sort();
+        return Err(format!(
+            "the telemetry server has no tool '{}'. It offers: {}",
+            args.tool,
+            names.join(", ")
+        ));
+    }
+    telemetry.call(&args.tool, Value::Object(args.arguments)).await
+}
+
 // ───────────────────────── search_logs ─────────────────────────
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchLogsArgs {
     /// Restrict to one trace. Case-insensitive.
     pub trace_id: Option<String>,
+    /// Restrict to one correlation id (database source only).
+    pub correlation_id: Option<String>,
     /// Restrict to one service, exactly as the exporter named it.
     pub service: Option<String>,
+    /// Restrict to one exception type, by full type name (database source only).
+    pub exception_type: Option<String>,
     /// Minimum severity: `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Fatal`.
     pub min_severity: Option<String>,
     /// Case-insensitive substring, matched against the body and attribute values.
@@ -514,6 +710,14 @@ pub struct SearchLogsArgs {
     pub until_unix_nano: Option<u64>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// Which store to read: `store` for OTLP payloads ingested into tinylink,
+    /// `database` for the deployment's telemetry database. Defaults to `store`.
+    ///
+    /// Not merged, on purpose. The database carries the rendered message as well as
+    /// the template; OTLP only ever carries the template. Merging them would mean one
+    /// row sometimes having a rendered body and sometimes not, which is a distinction
+    /// the caller cannot make afterwards.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -529,6 +733,26 @@ pub struct IngestLogsArgs {
 /// where they can be tested against a real exporter capture. Re-deriving any of
 /// that here would be a second implementation to keep in step with the first.
 pub async fn search_logs(backends: &Arc<Backends>, args: SearchLogsArgs) -> Result<Value> {
+    let source = args.source.as_deref().unwrap_or("store");
+
+    match source {
+        "store" => search_logs_in_store(backends, args).await,
+        "database" => search_logs_in_database(backends, args).await,
+        other => {
+            return Err(format!(
+                "unknown log source '{other}'. Use 'store' for OTLP payloads ingested \
+                 into tinylink, or 'database' for the deployment's telemetry database. \
+                 Run capabilities to see which are available."
+            ))
+        }
+    }
+}
+
+/// Search the OTLP payloads ingested into tinylink's store.
+async fn search_logs_in_store(
+    backends: &Arc<Backends>,
+    args: SearchLogsArgs,
+) -> Result<Value> {
     let link = backends.link_required("search_logs")?;
 
     let mut payload = serde_json::Map::new();
@@ -555,15 +779,94 @@ pub async fn search_logs(backends: &Arc<Backends>, args: SearchLogsArgs) -> Resu
     insert("offset", args.offset.map(|v| json!(v)));
 
     let mut out = link.call("search_logs", Value::Object(payload)).await?;
+    out["source"] = json!("store");
     // Say plainly when the store holds nothing, because "no logs found" and "logs
     // were never ingested" lead to opposite conclusions.
     if out["store_records"] == json!(0) {
         out["note"] = json!(
             "The log store is empty. Ingest OTLP payloads with `tinylink logs-ingest <path>` \
-             or the tinylink ingest_logs tool before searching."
+             or the tinylink ingest_logs tool before searching, or use \
+             source=database for the deployment's own logs."
         );
     }
     Ok(out)
+}
+
+/// Search the telemetry database the running services write to.
+///
+/// The parameter names are translated rather than passed through: a caller who learned
+/// `trace_id` and `min_severity` from the OTLP store should not have to learn a second
+/// vocabulary for the same question, and the telemetry server's own tool names are not
+/// an agent-facing contract.
+async fn search_logs_in_database(
+    backends: &Arc<Backends>,
+    args: SearchLogsArgs,
+) -> Result<Value> {
+    let telemetry = backends.telemetry_required("search_logs")?;
+
+    // The database stores nanoseconds as a plain integer column and takes the window as
+    // minutes, so a caller who gave absolute bounds gets them honoured where they can
+    // be. Without a bound the query is unbounded, which on a real deployment is the
+    // difference between an answer and a scan.
+    let window_minutes = args
+        .since_unix_nano
+        .map(|since| {
+            let elapsed = now_unix_nanos().saturating_sub(since) / 60_000_000_000;
+            elapsed.clamp(1, 60 * 24 * 30) as i64
+        })
+        .unwrap_or(60 * 24);
+
+    let level = args.min_severity.as_deref().and_then(severity_to_database_name);
+
+    let payload = json!({
+        "windowMinutes": window_minutes,
+        "limit": args.limit.unwrap_or(50),
+        "offset": args.offset.unwrap_or(0),
+        "traceId": args.trace_id,
+        "correlationId": args.correlation_id,
+        "service": args.service,
+        "text": args.contains,
+        "exceptionType": args.exception_type,
+        "minimumLevel": level,
+    });
+
+    let mut out = telemetry.call("search_logs", payload).await?;
+
+    // The database's rows are a different shape from the store's, so the answer says
+    // which shape it is rather than leaving the caller to notice that `body` is missing.
+    out["source"] = json!("database");
+    out["note"] = json!(
+        "Rows come from the telemetry database, not the OTLP store. Each carries \
+         `message` (the template the service logged) and `formattedMessage` (the \
+         rendered text), where an OTLP record only ever has the template."
+    );
+    Ok(out)
+}
+
+/// Translate an OTLP severity name into the name the database store uses.
+///
+/// Not a rename: the two vocabularies genuinely differ — OTLP says `info`, `warn` and
+/// `fatal` where the .NET logging levels say `information`, `warning` and `critical` —
+/// so this is the one place the difference is written down. An unrecognised name
+/// returns None and is dropped, which leaves the query unfiltered rather than guessing a
+/// threshold: a wrong floor hides logs, and no floor shows them.
+fn severity_to_database_name(name: &str) -> Option<&'static str> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" | "information" => "information",
+        "warn" | "warning" => "warning",
+        "error" => "error",
+        "fatal" | "critical" => "critical",
+        _ => return None,
+    })
+}
+
+fn now_unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Ingest OTLP log payloads into tinylink's log store.

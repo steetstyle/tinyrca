@@ -55,6 +55,13 @@ pub struct ServeArgs {
     /// URL of a tiny-pdg-cs server already running over Streamable HTTP
     #[arg(long, value_name = "URL")]
     pub pdg_url: Option<String>,
+    /// Telemetry.Mcp.Server assembly, run as a stdio child. Reads the deployment's
+    /// own telemetry database, which is the only source of runtime paths.
+    #[arg(long, value_name = "DLL")]
+    pub telemetry: Option<PathBuf>,
+    /// URL of a Telemetry.Mcp.Server already running over Streamable HTTP
+    #[arg(long, value_name = "URL")]
+    pub telemetry_url: Option<String>,
     /// Directory containing the C# sources, for the code-analysis server
     #[arg(long, value_name = "DIR")]
     pub sources: Option<PathBuf>,
@@ -85,6 +92,7 @@ impl ServeArgs {
             .as_ref()
             .map(|binary| backends::Endpoint::Stdio {
                 binary: binary.clone(),
+                env: Vec::new(),
                 args: {
                     let mut args = vec!["serve".to_string()];
                     if let Some(ref index) = self.index {
@@ -96,6 +104,25 @@ impl ServeArgs {
             })
     }
 
+    /// How to reach the telemetry server, if requested at all.
+    ///
+    /// Over stdio it is launched as `dotnet <dll>`, which is why the argument is an
+    /// assembly path rather than a native binary: the MCP server is a .NET program and
+    /// asking for the managed assembly keeps the caller from having to know where the
+    /// host is installed.
+    fn telemetry_endpoint(&self) -> Option<backends::Endpoint> {
+        if let Some(url) = self.telemetry_url.as_ref() {
+            return Some(backends::Endpoint::Http {
+                url: url.as_str().into(),
+            });
+        }
+        self.telemetry.as_ref().map(|dll| backends::Endpoint::Stdio {
+            binary: std::path::PathBuf::from("dotnet"),
+            args: vec![dll.display().to_string()],
+            env: Vec::new(),
+        })
+    }
+
     fn pdg_endpoint(&self) -> Option<backends::Endpoint> {
         if let Some(url) = self.pdg_url.as_ref() {
             return Some(backends::Endpoint::Http {
@@ -104,6 +131,7 @@ impl ServeArgs {
         }
         self.pdg.as_ref().map(|binary| backends::Endpoint::Stdio {
             binary: binary.clone(),
+            env: Vec::new(),
             // tiny-pdg-cs takes the source path per call, so nothing to pass here.
             args: vec!["serve".to_string()],
         })
@@ -152,6 +180,20 @@ impl RcaServer {
                 Err(e) => {
                     tracing::warn!("tiny-pdg-cs unavailable: {e:#}");
                     notes.push(format!("tiny-pdg-cs (static analysis): {e:#}"));
+                }
+            }
+        }
+
+        if let Some(endpoint) = args.telemetry_endpoint() {
+            match backends::McpLink::connect("telemetry", endpoint).await {
+                Ok(link) => {
+                    tracing::info!(tools = ?link.tools(), "telemetry connected");
+                    backends.telemetry = Some(Arc::new(link));
+                }
+                Err(e) if args.strict => return Err(e),
+                Err(e) => {
+                    tracing::warn!("telemetry unavailable: {e:#}");
+                    notes.push(format!("telemetry (runtime paths, live logs): {e:#}"));
                 }
             }
         }
@@ -271,7 +313,7 @@ impl RcaServer {
     /// Search the log store.
     #[tool(
         name = "search_logs",
-        description = "Search ingested logs by trace id, service, minimum severity, free text or attribute key. Free text matches attribute values as well as the body, which matters because the .NET exporter sends the unrendered message template as the body. Combine it with a trace id from investigate_error to read what a failing request actually logged.",
+        description = "Search logs by trace id, service, minimum severity, free text or attribute key. Free text matches attribute values as well as the body, which matters because the .NET exporter sends the unrendered message template as the body. Combine it with a trace id from investigate_error to read what a failing request actually logged.\n\nTwo stores, chosen with `source`: 'store' reads OTLP payloads you ingested into tinylink and covers only the traffic you captured; 'database' reads the deployment's own telemetry database and carries the rendered message as well as the template, so an interpolated value like a tenant id is findable as text. They are not merged. Run capabilities to see which are available.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -305,6 +347,26 @@ impl RcaServer {
         args: Parameters<tools::IngestLogsArgs>,
     ) -> Result<String, McpError> {
         tools::ingest_logs(&self.backends, args.0)
+            .await
+            .map(render)
+            .map_err(to_mcp)
+    }
+
+    #[tool(
+        name = "telemetry_call",
+        description = "Call one of the telemetry database's own read-only tools and get its answer verbatim.\n\nUse this for anything about live telemetry that the trace and code tools cannot answer: runtime paths (`error_paths`, `path_diff`, `path_profile`, `new_paths`), baggage scope (`find_by_baggage`), route health (`endpoint_health`), or what is being recorded at all (`capture_coverage`). Run `capabilities` first to see which are available and what each server contributes.\n\nNot a convenience wrapper: the arguments are the telemetry tool's own, passed through unchanged, so nothing here can drift from what that server accepts.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn telemetry_call(
+        &self,
+        args: Parameters<tools::TelemetryCallArgs>,
+    ) -> Result<String, McpError> {
+        tools::telemetry_call(&self.backends, args.0)
             .await
             .map(render)
             .map_err(to_mcp)
@@ -385,11 +447,12 @@ mod tests {
             "method_dependencies",
             "search_logs",
             "ingest_logs",
+            "telemetry_call",
             "capabilities",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 6, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 7, "unexpected tool set: {names:?}");
     }
 
     #[test]

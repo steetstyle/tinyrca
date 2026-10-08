@@ -11,21 +11,31 @@ three places — OTLP traces, logs, and C# source.
       agent
         │
         ▼
-┌───────────────┐
-│   tiny-rca    │   orchestrates; owns no analysis
-└───────┬───────┘
-        │ MCP over stdio
-   ┌────┴─────┐
-   ▼          ▼
-┌──────────┐ ┌──────────────┐
-│ tinylink │ │ tiny-pdg-cs  │
-│ trace→code│ │ callers, PDG │
-└──────────┘ └──────────────┘
+┌───────────────────┐
+│     tiny-rca      │   orchestrates; owns no analysis
+└─────┬───────┬─────┘
+      │ MCP over stdio
+ ┌────┴──┐  ┌──┴────────┐  ┌───────────────┐
+ ▼       ▼  ▼           ▼  ▼               ▼
+┌──────────┐ ┌──────────────┐ ┌──────────────────────┐
+│ tinylink │ │ tiny-pdg-cs  │ │ Telemetry.Mcp.Server │
+│ trace→code│ │ callers, PDG │ │ live telemetry, and  │
+└──────────┘ └──────────────┘ │ the runtime path     │
+                              │ catalog              │
+                              └──────────────────────┘
 ```
 
-Both backends are optional and independent. Neither is reimplemented here: route
-extraction lives in tiny-pdg-cs, the trace→code join in tinylink. A third copy
-would drift from both, and a drifted route table is worse than no route table.
+All three are optional and independent. None is reimplemented here: route
+extraction lives in tiny-pdg-cs, the trace→code join in tinylink, and reading the
+deployment's own telemetry database in the .NET server. A copy would drift from
+the original, and a drifted route table is worse than no route table.
+
+The third one is a different kind of dependency. The first two are built from the
+source you are investigating. The telemetry server reads the database the running
+services wrote — which is the only place a **runtime path catalog** exists. Which
+branch of the code a request actually took is recorded by the service's own
+instrumentation; a trace capture cannot reconstruct it, and neither can a static
+analysis of the repository.
 
 tiny-rca holds four files. The value is in the ordering and the handoffs, not in
 the analysis.
@@ -50,10 +60,17 @@ tinylink index ./MySolution -o tinylink.db
 
 # 2. serve — stdio, which is what an MCP client launches
 tiny-rca serve \
-  --tinylink ../tinylink/target/release/tinylink \
-  --index    tinylink.db \
-  --pdg      ../tiny-pdg-cs/target/release/tiny-pdg-cs
+  --tinylink  ../tinylink/target/release/tinylink \
+  --index     tinylink.db \
+  --pdg       ../tiny-pdg-cs/target/release/tiny-pdg-cs \
+  --telemetry ../unicpeak-analytics-api/Telemetry.Mcp.Server/bin/Debug/net10.0/Telemetry.Mcp.Server.dll
 ```
+
+`--telemetry` takes a **.NET assembly**, not a native binary, and is launched as
+`dotnet <dll>`. It also needs to reach the telemetry database, so it inherits your
+`TELEMETRY_CLICKHOUSE_*` / `TELEMETRY_POSTGRESQL_*` environment; point those at the
+database you are investigating. The assembly path comes from a build, so a
+`--telemetry-url` is usually easier once the server is deployed.
 
 A backend that fails to start is reported by `capabilities` rather than aborting,
 so a partial setup still answers trace-level questions. Pass `--strict` to make
@@ -103,6 +120,7 @@ exposing either.
 | `method_dependencies` | PDG: which statements a branch depends on |
 | `search_logs` | What did this trace, service or error string actually log? |
 | `ingest_logs` | Load OTLP log payloads into the log store (the one tool that writes) |
+| `telemetry_call` | Any of the telemetry database's own read-only tools, passed through |
 | `capabilities` | Which servers are connected and what can be answered |
 
 `investigate_error` returns `next_steps` naming the concrete follow-up calls, so
@@ -183,6 +201,74 @@ Following that hint:
    "callees":[{"method":"HandleAsync","line":23},{"method":"ToList","line":36},{"method":"ToString","line":40}]}]}
 ```
 
+## The telemetry database: runtime paths and live logs
+
+The third backend is the only source of answers the other two cannot produce. Reached
+through `telemetry_call`, which passes its arguments through unchanged:
+
+```jsonc
+{"name": "telemetry_call", "arguments": {
+   "tool": "error_paths",
+   "arguments": {"windowMinutes": 43200, "limit": 2}}}
+```
+
+```jsonc
+{"provider": "ClickHouse", "windowMinutes": 43200, "returned": 2, "paths": [
+  {"pathId": "34424", "scope": "Scope.Agency.Handle", "errorSpans": 2523,
+   "exceptionType": "System.InvalidOperationException",
+   "sharedWithHealthyPath": "8264",
+   "distinguishingSteps": [],
+   "sameStepsAsHealthyPath": true,
+   "readNext": "This path takes the same steps as the busiest healthy path for its scope, so the difference is not control flow. Compare what those steps returned, and the trace's logs, rather than the path itself."}]}
+```
+
+That is the join the other two backends cannot make on their own. `investigate_error`
+says *which line* threw; `error_paths` says *which path through the code* led there,
+and which steps it takes that the busiest healthy path for the same scope does not.
+`path_diff` then narrows that to the step where two paths part.
+
+Worth knowing by name, because nothing else answers them:
+
+| Tool | Answers |
+| --- | --- |
+| `error_paths` | which runtime paths ended in an exception, and how they differ from the healthy one |
+| `path_diff` | the exact step where two paths part |
+| `path_profile` | every distinct path one scope takes, busiest first |
+| `new_paths` | behaviour that did not happen before — a new branch, a flag turned on, a regression |
+| `find_by_baggage` | did these failures all belong to one tenant, flag or region |
+| `endpoint_health` | error rate and latency percentiles per route over live traffic |
+| `capture_coverage` | what is configured to be recorded, and when each table last got a row |
+
+**`capture_coverage` is the one to call first.** A query that returns nothing is
+ambiguous: nothing happened, the capture filter excluded it, the code is not
+instrumented, or the path flusher has not run yet. Those four look identical from
+the outside, and only one of them is about your application.
+
+### Why a pass-through and not twelve mirrored tools
+
+Mirroring them would put a second copy of every schema in this repository, and the
+copy would be wrong the first time the telemetry server changed a parameter — while
+still claiming to be authoritative. A pass-through cannot drift. All twelve tools are
+read-only, so nothing reachable here writes.
+
+### Two log stores, and the difference that matters
+
+`search_logs` takes a `source`:
+
+| `source` | Reads | Limitation |
+| --- | --- | --- |
+| `store` | OTLP payloads ingested into tinylink | only the traffic you captured; body is the **unrendered template** |
+| `database` | the deployment's telemetry database | needs the telemetry server; body **and rendered message** both searchable |
+
+They are not merged. The database carries strictly more — an interpolated value like
+a tenant id is findable as text there and is not in OTLP, because the .NET exporter
+sends the template and puts the values in attributes. Merging them would produce rows
+that sometimes have a rendered body and sometimes do not, which is a distinction the
+caller cannot make after the fact.
+
+`capabilities` reports both, with their availability, so an agent does not have to
+guess which one to reach for.
+
 ## Logs
 
 tiny-rca reads whatever trace you give it, but logs work differently: traces
@@ -250,7 +336,7 @@ but not logs gives an agent nothing to read for the error itself, and
 ```
 src/
   main.rs       binary entry point: clap, logging, serve wiring
-  lib.rs        RcaServer: the MCP server, its six tools, backend connections
+  lib.rs        RcaServer: the MCP server, its seven tools, backend connections
   backends.rs   spawning or connecting to tinylink and tiny-pdg-cs
   tools.rs      the tool bodies and the arguments they take
 tests/
@@ -276,10 +362,29 @@ without a transport.
 cargo test
 ```
 
-**31 tests.** `tests/integration_test.rs` starts a real `tiny-rca`, which spawns
+**33 tests.** `tests/integration_test.rs` starts a real `tiny-rca`, which spawns
 both backends, and drives the whole chain over real JSON-RPC — a trace in, a
 method, file and line out. It skips the backend cases when the binaries are not
 built; build them with `--release` to exercise them.
+
+## Speaking to a .NET MCP server
+
+If you point any of these backends at a .NET MCP server — and there are seven in
+the unicpeak solution — the handshake fails on protocol version:
+
+```text
+UnsupportedProtocolVersionException: Protocol version '2026-07-28' is not
+available through the initialize handshake.
+({"requested":"2026-07-28","supported":["2024-11-05","2025-03-26","2025-06-18","2025-11-25"]})
+```
+
+rmcp 3.5 proposes `2026-07-28`; `ModelContextProtocol` 2.2.0 supports up to
+`2025-11-25`. The .NET server does **not** negotiate down — an unrecognised version
+fails outright — so no .NET MCP server is reachable at all, however it is addressed.
+
+`PinnedVersion` in `backends.rs` proposes `LATEST_WITH_INITIALIZE` instead. Nothing is
+lost: the Rust SDK implements it, and choosing a version is what the field is for. Raise
+it when the .NET SDK catches up.
 
 ## Why
 

@@ -35,6 +35,9 @@ fn main() {
                 "investigate_error",
                 "explain_method",
                 "method_dependencies",
+                "search_logs",
+                "ingest_logs",
+                "telemetry_call",
                 "capabilities",
             ] {
                 println!("{name}");

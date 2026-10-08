@@ -213,7 +213,7 @@ fn tiny_rca_serves_its_own_tools_with_no_backends() {
     assert_eq!(caps["can_map_traces_to_code"], false, "{caps}");
     assert_eq!(caps["can_analyse_code"], false, "{caps}");
     let servers = caps["servers"].as_array().unwrap();
-    assert_eq!(servers.len(), 2, "{caps}");
+    assert_eq!(servers.len(), 3, "{caps}");
 
     let err = mcp
         .try_call("investigate_error", json!({"trace": FAILING_TRACE}))
@@ -244,7 +244,8 @@ fn tiny_rca_lists_only_its_own_tools() {
             "ingest_logs",
             "investigate_error",
             "method_dependencies",
-            "search_logs"
+            "search_logs",
+            "telemetry_call"
         ],
         "tiny-rca should expose its bridging tools, not duplicate the backends': {names:?}"
     );
@@ -570,11 +571,16 @@ fn capabilities_advertises_log_search_and_how_to_load_it() {
 
     let caps = mcp.call("capabilities", json!({}));
     assert_eq!(caps["can_search_logs"], true, "{caps}");
+    // With only tinylink connected, the OTLP store is the available source and the
+    // database one is reported as unavailable rather than implied.
+    assert_eq!(caps["log_sources"]["store"]["available"], true, "{caps}");
+    assert_eq!(caps["log_sources"]["database"]["available"], false, "{caps}");
+    assert_eq!(caps["can_resolve_runtime_paths"], false, "{caps}");
     assert!(
         caps["log_guidance"]
             .as_str()
             .unwrap_or("")
-            .contains("ingest_logs"),
+            .contains("source="),
         "{caps}"
     );
 }
