@@ -24,6 +24,17 @@ pub struct InvestigateArgs {
     /// it is opt-in.
     #[serde(default)]
     pub include_dependencies: bool,
+    /// Also fetch the logs of each failing trace.
+    ///
+    /// Off by default because it costs one round trip per failing trace, and most
+    /// services do not export logs at all. When it is on and nothing comes back,
+    /// the response says whether the store is empty or simply has no records for
+    /// that trace — the two mean very different things.
+    #[serde(default)]
+    pub include_logs: bool,
+    /// How many log records to attach per trace.
+    #[serde(default)]
+    pub log_limit: Option<usize>,
 }
 
 /// The incident entry point: trace in, mapped hops out.
@@ -73,6 +84,42 @@ pub async fn investigate_error(backends: &Arc<Backends>, args: InvestigateArgs) 
                         }
                     }
                 }
+            }
+        }
+
+        if args.include_logs {
+            // A hop's trace ids are what tie code to logs. The hop that carries a
+            // trace id is the one whose logs explain the failure, so query per
+            // trace rather than per hop.
+            let traces: Vec<String> = item["trace_ids"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let log_limit = args.log_limit.unwrap_or(20).max(1);
+            let mut collected = Vec::new();
+            for trace in &traces {
+                match search_logs(
+                    backends,
+                    SearchLogsArgs {
+                        trace_id: Some(trace.clone()),
+                        limit: Some(log_limit),
+                        ..Default::default()
+                    },
+                )
+                .await
+                {
+                    Ok(v) => collected.push(v),
+                    Err(message) => collected.push(json!({ "error": message })),
+                }
+            }
+            if !traces.is_empty() {
+                item["logs"] = Value::Array(collected);
+            } else {
+                item["logs"] = json!(null);
             }
         }
 
@@ -141,6 +188,19 @@ fn next_steps(edges: &[Value]) -> Vec<String> {
         steps.push(
             "At least one mapping has low confidence (below 0.8); verify the handler \
              before concluding."
+                .to_string(),
+        );
+    }
+
+    // Point at logs only when there is a trace to join on, otherwise the advice is
+    // a dead end.
+    let has_trace = edges
+        .iter()
+        .any(|e| e["trace_ids"].as_array().is_some_and(|ids| !ids.is_empty()));
+    if has_trace {
+        steps.push(
+            "Call investigate_error with include_logs=true, or search_logs with the trace id, \
+             to read what the failing request actually logged."
                 .to_string(),
         );
     }
@@ -305,6 +365,8 @@ mod tests {
                 trace: "{}".into(),
                 limit: None,
                 include_dependencies: false,
+                include_logs: false,
+                log_limit: None,
             },
         )
         .await
@@ -406,4 +468,92 @@ mod tests {
             "with nothing mapped, suggest checking capabilities: {steps:?}"
         );
     }
+}
+
+// ───────────────────────── search_logs ─────────────────────────
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchLogsArgs {
+    /// Restrict to one trace. Case-insensitive.
+    pub trace_id: Option<String>,
+    /// Restrict to one service, exactly as the exporter named it.
+    pub service: Option<String>,
+    /// Minimum severity: `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Fatal`.
+    pub min_severity: Option<String>,
+    /// Case-insensitive substring, matched against the body and attribute values.
+    pub contains: Option<String>,
+    /// Search attribute values only, ignoring the body.
+    pub attributes_only: Option<bool>,
+    /// Only records having an attribute with this key.
+    pub attribute_key: Option<String>,
+    /// Inclusive lower bound, Unix nanoseconds.
+    pub since_unix_nano: Option<u64>,
+    /// Exclusive upper bound, Unix nanoseconds.
+    pub until_unix_nano: Option<u64>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct IngestLogsArgs {
+    /// An OTLP payload file, or a directory with one payload per file.
+    pub source: String,
+}
+
+/// Search the log store that `tinylink` maintains.
+///
+/// This is a pass-through, and deliberately so: the filters, the paging and the
+/// fields that explain a short answer are all decided in one place, in tinylink,
+/// where they can be tested against a real exporter capture. Re-deriving any of
+/// that here would be a second implementation to keep in step with the first.
+pub async fn search_logs(backends: &Arc<Backends>, args: SearchLogsArgs) -> Result<Value> {
+    let link = backends.link_required("search_logs")?;
+
+    let mut payload = serde_json::Map::new();
+    let mut insert = |key: &str, value: Option<Value>| {
+        if let Some(v) = value {
+            payload.insert(key.to_string(), v);
+        }
+    };
+    insert("trace_id", args.trace_id.map(Value::String));
+    insert("service", args.service.map(Value::String));
+    insert("min_severity", args.min_severity.map(Value::String));
+    insert("contains", args.contains.map(Value::String));
+    insert("attributes_only", args.attributes_only.map(Value::Bool));
+    insert("attribute_key", args.attribute_key.map(Value::String));
+    insert(
+        "since_unix_nano",
+        args.since_unix_nano.map(|v| json!(v.to_string())),
+    );
+    insert(
+        "until_unix_nano",
+        args.until_unix_nano.map(|v| json!(v.to_string())),
+    );
+    insert("limit", args.limit.map(|v| json!(v)));
+    insert("offset", args.offset.map(|v| json!(v)));
+
+    let mut out = link.call("search_logs", Value::Object(payload)).await?;
+    // Say plainly when the store holds nothing, because "no logs found" and "logs
+    // were never ingested" lead to opposite conclusions.
+    if out["store_records"] == json!(0) {
+        out["note"] = json!(
+            "The log store is empty. Ingest OTLP payloads with `tinylink logs-ingest <path>` \
+             or the tinylink ingest_logs tool before searching."
+        );
+    }
+    Ok(out)
+}
+
+/// Ingest OTLP log payloads into tinylink's log store.
+///
+/// Bridges to tinylink rather than opening the store here: the schema, the
+/// migration and the payload sniffing live with the code that owns the file, and a
+/// second writer would have to agree with all of it.
+pub async fn ingest_logs(backends: &Arc<Backends>, args: IngestLogsArgs) -> Result<Value> {
+    let link = backends.link_required("ingest_logs")?;
+    if !link.has_tool("ingest_logs") {
+        return Err("the connected tinylink server predates log support; rebuild it".to_string());
+    }
+    link.call("ingest_logs", json!({ "source": args.source }))
+        .await
 }

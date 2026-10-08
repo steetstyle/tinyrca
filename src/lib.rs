@@ -165,7 +165,7 @@ impl RcaServer {
     /// Serve over Streamable HTTP until the process is stopped.
     ///
     /// Stdio is the default because an MCP client launches the binary; HTTP is
-    /// for shared or remote deployments. Same four tools either way.
+    /// for shared or remote deployments. Same six tools either way.
     pub async fn serve_http(self, args: ServeArgs) -> anyhow::Result<()> {
         use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
         use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
@@ -268,6 +268,48 @@ impl RcaServer {
             .map_err(to_mcp)
     }
 
+    /// Search the log store.
+    #[tool(
+        name = "search_logs",
+        description = "Search ingested logs by trace id, service, minimum severity, free text or attribute key. Free text matches attribute values as well as the body, which matters because the .NET exporter sends the unrendered message template as the body. Combine it with a trace id from investigate_error to read what a failing request actually logged.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn search_logs(
+        &self,
+        args: Parameters<tools::SearchLogsArgs>,
+    ) -> Result<String, McpError> {
+        tools::search_logs(&self.backends, args.0)
+            .await
+            .map(render)
+            .map_err(to_mcp)
+    }
+
+    /// Load OTLP log payloads.
+    #[tool(
+        name = "ingest_logs",
+        description = "Read OTLP log payloads (protobuf or JSON, gzipped or not) into the log store that search_logs queries. Takes a payload file or a directory with one payload per file, and reports what failed to load.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn ingest_logs(
+        &self,
+        args: Parameters<tools::IngestLogsArgs>,
+    ) -> Result<String, McpError> {
+        tools::ingest_logs(&self.backends, args.0)
+            .await
+            .map(render)
+            .map_err(to_mcp)
+    }
+
     #[tool(
         name = "capabilities",
         description = "Report which analysis servers are connected, what tools they expose, and what is unavailable. Use this to find out whether code-level analysis is possible before planning an investigation.",
@@ -322,7 +364,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn router_registers_the_four_rca_tools() {
+    fn router_registers_the_rca_tools() {
         let router = RcaServer::tool_router();
         let names: Vec<String> = router
             .list_all()
@@ -333,22 +375,33 @@ mod tests {
             "investigate_error",
             "explain_method",
             "method_dependencies",
+            "search_logs",
+            "ingest_logs",
             "capabilities",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 4, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 6, "unexpected tool set: {names:?}");
     }
 
     #[test]
-    fn tools_are_read_only_and_described() {
+    fn tools_are_described_and_flag_whether_they_write() {
+        // `ingest_logs` writes to the log store. A client that gates approvals on
+        // the annotation would otherwise let a state change through unprompted.
+        const WRITES: [&str; 1] = ["ingest_logs"];
+
         let router = RcaServer::tool_router();
         for tool in router.list_all() {
             let annotations = tool
                 .annotations
                 .as_ref()
                 .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
-            assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
+            assert_eq!(
+                annotations.read_only_hint,
+                Some(!WRITES.contains(&tool.name.as_ref())),
+                "{}",
+                tool.name
+            );
             assert!(tool.description.as_deref().unwrap().len() > 40);
         }
     }

@@ -239,8 +239,10 @@ fn tiny_rca_lists_only_its_own_tools() {
         vec![
             "capabilities",
             "explain_method",
+            "ingest_logs",
             "investigate_error",
-            "method_dependencies"
+            "method_dependencies",
+            "search_logs"
         ],
         "tiny-rca should expose its bridging tools, not duplicate the backends': {names:?}"
     );
@@ -404,4 +406,144 @@ fn server_binary_path_helper_agrees_with_the_filesystem() {
         }
         None => eprintln!("backends not built; integration cases will skip"),
     }
+}
+
+// ── the log chain, through tiny-rca ──
+
+/// A log payload carrying the same trace id as `FAILING_TRACE`.
+///
+/// Written as OTLP/JSON rather than reusing the protobuf capture, because the
+/// point here is the join: the trace tool and the log tool have to agree on a
+/// trace id, and they only do if the id is threaded through both.
+fn write_logs_for_the_failing_trace(root: &Path) -> PathBuf {
+    let dir = root.join("logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let payload = serde_json::json!({
+        "resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "Agency.API"}}
+            ]},
+            "scopeLogs": [{"logRecords": [
+                {
+                    "severityNumber": 9,
+                    "severityText": "Information",
+                    "body": {"stringValue": "Request started for {Endpoint}"},
+                    "traceId": "t-rca",
+                    "attributes": [
+                        {"key": "Endpoint", "value": {"stringValue": "/api/agency/9f1c/member"}}
+                    ]
+                },
+                {
+                    "severityNumber": 17,
+                    "severityText": "Error",
+                    "body": {"stringValue": "Handler {HandlerName} failed"},
+                    "traceId": "t-rca",
+                    "attributes": [
+                        {"key": "HandlerName", "value": {"stringValue": "GetMembers"}},
+                        {"key": "exception.type", "value": {"stringValue": "TimeoutException"}},
+                        {"key": "exception.message",
+                         "value": {"stringValue": "upstream agency service did not respond"}}
+                    ]
+                }
+            ]}]
+        }]
+    });
+    let path = dir.join("agency-logs.json");
+    std::fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn logs_reach_the_agent_through_tiny_rca() {
+    let Some((tinylink_bin, _)) = backend_binaries() else {
+        eprintln!("skipping: build tinylink and tiny-pdg-cs first");
+        return;
+    };
+    let (root, db) = setup_project("logs_chain");
+    let payload = write_logs_for_the_failing_trace(&root);
+
+    let mut mcp = Mcp::start(&[
+        "--tinylink".into(),
+        tinylink_bin.display().to_string(),
+        "--index".into(),
+        db.display().to_string(),
+    ]);
+
+    // 1. Ingest through the bridge, not through tinylink directly.
+    let ingested = mcp.call(
+        "ingest_logs",
+        json!({ "source": payload.display().to_string() }),
+    );
+    assert_eq!(ingested["records_inserted"], 2, "{ingested}");
+    assert_eq!(ingested["services"][0], "Agency.API", "{ingested}");
+
+    // 2. Free text that only exists in an attribute. A body-only search would not
+    //    find this, because the body is the unrendered template.
+    let found = mcp.call(
+        "search_logs",
+        json!({ "contains": "upstream agency service did not respond" }),
+    );
+    assert_eq!(found["count"], 1, "{found}");
+    assert_eq!(found["logs"][0]["severity"], "Error", "{found}");
+
+    // 3. The join: the trace tool names the failing method, the logs say why.
+    let investigated = mcp.call(
+        "investigate_error",
+        json!({ "trace": FAILING_TRACE, "include_logs": true }),
+    );
+    let hop = &investigated["investigation"][0];
+    assert_eq!(
+        hop["to"]["method"], "GetMembersEndpoint.Handler",
+        "{investigated}"
+    );
+    assert_eq!(
+        hop["logs"].as_array().map(Vec::len),
+        Some(1),
+        "{investigated}"
+    );
+    let per_trace = &hop["logs"][0];
+    assert_eq!(per_trace["total_matched"], 2, "{investigated}");
+    let records = per_trace["logs"].as_array().expect("records");
+    assert_eq!(records.len(), 2, "the whole trace, not just the error");
+    // Newest first, so the error leads — that is what the failure was.
+    assert_eq!(records[0]["severity"], "Error", "{investigated}");
+    assert_eq!(
+        records[0]["attributes"]["exception.type"], "TimeoutException",
+        "{investigated}"
+    );
+
+    // 4. next_steps should point at the log tool, since a trace id is available.
+    let steps = investigated["next_steps"].as_array().expect("next_steps");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("search_logs")),
+        "{investigated}"
+    );
+}
+
+/// An empty log store must say so, because "no logs found" and "logs were never
+/// ingested" lead to opposite conclusions.
+#[test]
+fn searching_an_empty_log_store_says_how_to_fill_it() {
+    let Some((tinylink_bin, _)) = backend_binaries() else {
+        eprintln!("skipping: build tinylink and tiny-pdg-cs first");
+        return;
+    };
+    let (_root, db) = setup_project("logs_empty");
+
+    let mut mcp = Mcp::start(&[
+        "--tinylink".into(),
+        tinylink_bin.display().to_string(),
+        "--index".into(),
+        db.display().to_string(),
+    ]);
+
+    let out = mcp.call("search_logs", json!({}));
+    assert_eq!(out["count"], 0, "{out}");
+    assert_eq!(out["store_records"], 0, "{out}");
+    assert!(
+        out["note"].as_str().unwrap_or("").contains("logs-ingest"),
+        "the response should say how to populate the store: {out}"
+    );
 }

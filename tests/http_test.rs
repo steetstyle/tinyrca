@@ -339,8 +339,10 @@ async fn tiny_rca_over_http_exposes_the_same_tools_as_stdio() {
         vec![
             "capabilities",
             "explain_method",
+            "ingest_logs",
             "investigate_error",
-            "method_dependencies"
+            "method_dependencies",
+            "search_logs"
         ],
         "HTTP must expose the same tools as stdio: {names:?}"
     );
