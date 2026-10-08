@@ -95,6 +95,8 @@ before exposing either.
 | `investigate_error` | Which errored hop caused this failure, and in which line of code? Start here. |
 | `explain_method` | What endpoints reach this method, who calls it, what does it call? |
 | `method_dependencies` | PDG: which statements a branch depends on |
+| `search_logs` | What did this trace, service or error string actually log? |
+| `ingest_logs` | Load OTLP log payloads into the log store (the one tool that writes) |
 | `capabilities` | Which servers are connected and what can be answered |
 
 `investigate_error` returns `next_steps` naming the concrete follow-up calls, so
@@ -144,6 +146,35 @@ binaries are not built; build them with `--release` to exercise them.
 
 ## Logs
 
-tiny-rca reads whatever trace you give it. Note that OTLP **log** export has to
-be enabled on the services being investigated — a solution that exports traces
-and metrics but not logs gives an agent nothing to read for the error itself.
+tiny-rca reads whatever trace you give it, but logs work differently: traces
+arrive per call, logs are loaded once and then queried.
+
+```jsonc
+// 1. load the payloads — a file, or a directory with one payload per file
+{"name": "ingest_logs", "arguments": {"source": "/var/log/otel"}}
+
+// 2. either query them directly...
+{"name": "search_logs", "arguments": {"min_severity": "Error", "contains": "TimeoutException"}}
+
+// ...or attach them to the investigation
+{"name": "investigate_error", "arguments": {"trace": "trace.json", "include_logs": true}}
+```
+
+With `include_logs`, each failing hop carries the records its trace produced —
+so the answer names both the method that failed and the exception it threw, which
+is the join an incident actually needs.
+
+Two things about OTLP log data are worth knowing, both established by decoding a
+real `AddOtlpExporter` capture rather than reading the schema:
+
+- **The body is the unrendered message template.** A log exports as
+  `Handler {HandlerName} failed` with the values in separate attributes, so
+  free-text search covers attribute values too. Without that, the string you paste
+  in during an incident would not match the log containing it.
+- **The .NET SDK exports over gRPC on 4317** unless you set
+  `Protocol = OtlpExportProtocol.HttpProtobuf`. Capturing from a collector is the
+  usual way to get readable payloads.
+
+`services` must actually export logs. A solution that exports traces and metrics
+but not logs gives an agent nothing to read for the error itself, and
+`capabilities` says so rather than letting every log query come back empty.
