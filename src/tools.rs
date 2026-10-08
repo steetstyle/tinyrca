@@ -344,11 +344,33 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
         })),
     }
 
+    // Log support needs the tinylink backend *and* a server new enough to expose
+    // the tools. Reporting it as available on the strength of the connection alone
+    // would have the agent call a tool that does not exist.
+    let can_search_logs = match backends.link.as_ref() {
+        Some(link) => link.has_tool("search_logs") && link.has_tool("ingest_logs"),
+        None => false,
+    };
+
     Ok(json!({
         "servers": servers,
         "unavailable": backends.missing_report().await,
         "can_map_traces_to_code": backends.link.is_some(),
         "can_analyse_code": backends.pdg.is_some(),
+        "can_search_logs": can_search_logs,
+        // Said up front because it is the step most likely to be missing: traces
+        // arrive per call, but logs have to be loaded once before they can be
+        // searched.
+        "log_guidance": if can_search_logs {
+            "Call ingest_logs with an OTLP payload file, or a directory with one payload \
+             per file, before search_logs. An empty store makes every log query return \
+             nothing."
+                .to_string()
+        } else {
+            "Log search is unavailable: it needs a tinylink server exposing ingest_logs \
+             and search_logs. Rebuild tinylink if it is connected."
+                .to_string()
+        },
     }))
 }
 

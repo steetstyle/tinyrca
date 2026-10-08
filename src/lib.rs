@@ -333,13 +333,21 @@ impl ServerHandler for RcaServer {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::default();
         info.instructions = Some(
-            "Root-cause analysis for .NET microservices. Combines OpenTelemetry traces with \
-             the C# source to answer \"why did this request fail\". All tools are read-only. \
+            "Root-cause analysis for .NET microservices. Combines OpenTelemetry traces and \
+             logs with the C# source to answer \"why did this request fail\". Every tool is \
+             read-only except ingest_logs, which writes into the log store. \
+             \
              Typical flow: capabilities to see what is available, then investigate_error with \
              the failing trace to map each errored hop to a method, file and line with a \
              confidence score, then explain_method or method_dependencies on the result to \
              understand the code. Trace data is supplied per call — pass OTLP JSON inline or a \
-             file path."
+             file path. \
+             \
+             Logs are not supplied per call: they are loaded once with ingest_logs (a payload \
+             file, or a directory with one payload per file) and then queried with search_logs \
+             or with investigate_error's include_logs. Note that the .NET exporter sends the \
+             unrendered message template as the log body, so free-text search also covers \
+             attribute values — the interpolated text is not in the body."
                 .into(),
         );
         info.capabilities = rmcp::model::ServerCapabilities::builder()

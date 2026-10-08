@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{json, Value};
+use std::sync::Arc;
+use tiny_rca::backends::Backends;
 
 struct Mcp {
     child: Child,
@@ -545,5 +547,52 @@ fn searching_an_empty_log_store_says_how_to_fill_it() {
     assert!(
         out["note"].as_str().unwrap_or("").contains("logs-ingest"),
         "the response should say how to populate the store: {out}"
+    );
+}
+
+/// `capabilities` has to say whether logs can be searched *and* how to load them.
+/// Log search needs the tinylink backend and a server new enough to expose the
+/// tools, so a live connection alone is not enough to promise it.
+#[test]
+fn capabilities_advertises_log_search_and_how_to_load_it() {
+    let Some((tinylink_bin, _)) = backend_binaries() else {
+        eprintln!("skipping: build tinylink and tiny-pdg-cs first");
+        return;
+    };
+    let (_root, db) = setup_project("caps_logs");
+
+    let mut mcp = Mcp::start(&[
+        "--tinylink".into(),
+        tinylink_bin.display().to_string(),
+        "--index".into(),
+        db.display().to_string(),
+    ]);
+
+    let caps = mcp.call("capabilities", json!({}));
+    assert_eq!(caps["can_search_logs"], true, "{caps}");
+    assert!(
+        caps["log_guidance"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ingest_logs"),
+        "{caps}"
+    );
+}
+
+/// Without a backend the capability has to be reported as unavailable rather than
+/// assumed, so an agent plans around what exists.
+#[tokio::test]
+async fn capabilities_reports_log_search_unavailable_without_a_backend() {
+    let backends = Arc::new(Backends::new());
+    let caps = tiny_rca::tools::capabilities(&backends)
+        .await
+        .expect("capabilities");
+    assert_eq!(caps["can_search_logs"], false, "{caps}");
+    assert!(
+        caps["log_guidance"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unavailable"),
+        "{caps}"
     );
 }
