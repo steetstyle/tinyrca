@@ -22,6 +22,22 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
+/// How to reach one backend server.
+#[derive(Debug, Clone)]
+pub enum Endpoint {
+    /// Spawn a binary and talk over its stdio.
+    Stdio {
+        binary: std::path::PathBuf,
+        args: Vec<String>,
+    },
+    /// Connect to a Streamable HTTP endpoint.
+    ///
+    /// Use this when the backend runs as a shared server — several tiny-rca
+    /// instances against one index, or a backend in its own container. Spawning
+    /// a process per tiny-rca would reparse the solution each time.
+    Http { url: std::sync::Arc<str> },
+}
+
 /// Handle to one connected MCP server.
 pub struct McpLink {
     name: String,
@@ -32,52 +48,66 @@ pub struct McpLink {
 }
 
 impl McpLink {
-    /// Spawn a server binary over stdio and complete the MCP handshake.
-    pub async fn spawn(name: &str, binary: &Path, args: &[String]) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            binary.exists(),
-            "{} server binary not found at {}. Build it first, e.g. \
-             `cargo build --release --features mcp` in that project, or pass its path.",
-            name,
-            binary.display()
-        );
+    /// Connect to a backend and complete the MCP handshake.
+    ///
+    /// stdio and Streamable HTTP are separate types with no common trait object,
+    /// so each arm does its own handshake and they agree on the result.
+    pub async fn connect(name: &str, endpoint: Endpoint) -> anyhow::Result<Self> {
+        let (service, tool_list) = match &endpoint {
+            Endpoint::Stdio { binary, args } => {
+                anyhow::ensure!(
+                    binary.exists(),
+                    "{} server binary not found at {}. Build it first, e.g. \
+                     `cargo build --release --features mcp` in that project, or pass its path.",
+                    name,
+                    binary.display()
+                );
+                let mut cmd = Command::new(binary);
+                cmd.args(args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    // The child's stderr is not part of the protocol; discard it so a
+                    // chatty server cannot fill a pipe and block.
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                let transport = rmcp::transport::TokioChildProcess::new(cmd)
+                    .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", binary.display()))?;
+                handshake(transport, name, &endpoint).await?
+            }
+            Endpoint::Http { url } => {
+                anyhow::ensure!(
+                    url.starts_with("http://") || url.starts_with("https://"),
+                    "{} URL must start with http:// or https://, got '{}'",
+                    name,
+                    url
+                );
+                let transport = rmcp::transport::StreamableHttpClientTransport::from_uri(
+                    std::sync::Arc::clone(url),
+                );
+                handshake(transport, name, &endpoint).await?
+            }
+        };
 
-        let mut cmd = Command::new(binary);
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // The child's stderr is not part of the protocol; discard it so a
-            // chatty server cannot fill a pipe and block.
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-
-        let transport = rmcp::transport::TokioChildProcess::new(cmd)
-            .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", binary.display()))?;
-
-        let service = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            let service = ().serve(transport).await?;
-            let tools = service.list_all_tools().await?;
-            anyhow::Ok((service, tools))
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "{} did not complete the MCP handshake within 20s",
-                binary.display()
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("{} handshake failed: {e}", binary.display()))?;
-
-        let (service, tool_list) = service;
         let tools: Vec<String> = tool_list.iter().map(|t| t.name.to_string()).collect();
-
-        tracing::info!(server = name, tools = tools.len(), "connected");
+        tracing::info!(server = name, tools = tools.len(), ?endpoint, "connected");
 
         Ok(Self {
             name: name.to_string(),
             tools,
             service,
         })
+    }
+
+    /// Spawn a server binary over stdio and complete the MCP handshake.
+    pub async fn spawn(name: &str, binary: &Path, args: &[String]) -> anyhow::Result<Self> {
+        Self::connect(
+            name,
+            Endpoint::Stdio {
+                binary: binary.to_path_buf(),
+                args: args.to_vec(),
+            },
+        )
+        .await
     }
 
     pub fn name(&self) -> &str {
@@ -136,6 +166,33 @@ impl McpLink {
         serde_json::from_str(&text)
             .map_err(|e| format!("{} server returned non-JSON from '{tool}': {e}", self.name))
     }
+}
+
+/// Initialize a transport and list its tools, with a timeout.
+///
+/// A backend that accepts the connection but never completes the handshake —
+/// wrong URL, a plain HTTP server that is not MCP — would otherwise hang the
+/// agent indefinitely.
+async fn handshake<T, E, A>(
+    transport: T,
+    name: &str,
+    endpoint: &Endpoint,
+) -> anyhow::Result<(RunningService<rmcp::RoleClient, ()>, Vec<rmcp::model::Tool>)>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    A: Send + 'static,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let service = ().serve(transport).await?;
+        let tools = service.list_all_tools().await?;
+        anyhow::Ok((service, tools))
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("{name} did not complete the MCP handshake within 20s ({endpoint:?})")
+    })?
+    .map_err(|e| anyhow::anyhow!("{name} handshake failed: {e}"))
 }
 
 /// The two servers tiny-rca bridges, each optional.

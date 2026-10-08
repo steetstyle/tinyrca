@@ -46,15 +46,68 @@ pub struct ServeArgs {
     /// tinylink index database, required when --tinylink is given
     #[arg(long, value_name = "PATH")]
     pub index: Option<PathBuf>,
+    /// URL of a tinylink server already running over Streamable HTTP
+    #[arg(long, value_name = "URL")]
+    pub tinylink_url: Option<String>,
     /// tiny-pdg-cs binary (`tiny-pdg-cs serve`)
     #[arg(long, value_name = "PATH")]
     pub pdg: Option<PathBuf>,
+    /// URL of a tiny-pdg-cs server already running over Streamable HTTP
+    #[arg(long, value_name = "URL")]
+    pub pdg_url: Option<String>,
     /// Directory containing the C# sources, for the code-analysis server
     #[arg(long, value_name = "DIR")]
     pub sources: Option<PathBuf>,
+    /// Serve tiny-rca over Streamable HTTP instead of stdio
+    #[arg(long)]
+    pub http: bool,
+    /// Bind address for --http (loopback by default; no authentication)
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: std::net::IpAddr,
+    #[arg(long, default_value = "8080")]
+    pub port: u16,
+    #[arg(long, default_value = "mcp")]
+    pub path: String,
     /// Fail at startup if a requested server cannot be reached
     #[arg(long)]
     pub strict: bool,
+}
+
+impl ServeArgs {
+    /// How to reach tinylink, if requested at all.
+    fn tinylink_endpoint(&self) -> Option<backends::Endpoint> {
+        if let Some(url) = self.tinylink_url.as_ref() {
+            return Some(backends::Endpoint::Http {
+                url: url.as_str().into(),
+            });
+        }
+        self.tinylink
+            .as_ref()
+            .map(|binary| backends::Endpoint::Stdio {
+                binary: binary.clone(),
+                args: {
+                    let mut args = vec!["serve".to_string()];
+                    if let Some(ref index) = self.index {
+                        args.push("--index".to_string());
+                        args.push(index.display().to_string());
+                    }
+                    args
+                },
+            })
+    }
+
+    fn pdg_endpoint(&self) -> Option<backends::Endpoint> {
+        if let Some(url) = self.pdg_url.as_ref() {
+            return Some(backends::Endpoint::Http {
+                url: url.as_str().into(),
+            });
+        }
+        self.pdg.as_ref().map(|binary| backends::Endpoint::Stdio {
+            binary: binary.clone(),
+            // tiny-pdg-cs takes the source path per call, so nothing to pass here.
+            args: vec!["serve".to_string()],
+        })
+    }
 }
 
 impl RcaServer {
@@ -75,13 +128,8 @@ impl RcaServer {
         let mut backends = Backends::new();
         let mut notes: Vec<String> = Vec::new();
 
-        if let Some(binary) = args.tinylink.clone() {
-            let mut argv = vec!["serve".to_string()];
-            if let Some(ref index) = args.index {
-                argv.push("--index".to_string());
-                argv.push(index.display().to_string());
-            }
-            match backends::McpLink::spawn("tinylink", &binary, &argv).await {
+        if let Some(endpoint) = args.tinylink_endpoint() {
+            match backends::McpLink::connect("tinylink", endpoint).await {
                 Ok(link) => {
                     tracing::info!(tools = ?link.tools(), "tinylink connected");
                     backends.link = Some(Arc::new(link));
@@ -94,10 +142,8 @@ impl RcaServer {
             }
         }
 
-        if let Some(binary) = args.pdg.clone() {
-            // tiny-pdg-cs tools take the source path per call, so there is nothing
-            // global to pass at startup.
-            match backends::McpLink::spawn("tiny-pdg-cs", &binary, &["serve".to_string()]).await {
+        if let Some(endpoint) = args.pdg_endpoint() {
+            match backends::McpLink::connect("tiny-pdg-cs", endpoint).await {
                 Ok(link) => {
                     tracing::info!(tools = ?link.tools(), "tiny-pdg-cs connected");
                     backends.pdg = Some(Arc::new(link));
@@ -113,8 +159,50 @@ impl RcaServer {
         for note in notes {
             backends.note_missing(note).await;
         }
-        let _ = &args.sources;
         Ok(Self::new(Arc::new(backends)))
+    }
+
+    /// Serve over Streamable HTTP until the process is stopped.
+    ///
+    /// Stdio is the default because an MCP client launches the binary; HTTP is
+    /// for shared or remote deployments. Same four tools either way.
+    pub async fn serve_http(self, args: ServeArgs) -> anyhow::Result<()> {
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+        use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
+
+        let addr = std::net::SocketAddr::new(args.bind, args.port);
+        if !args.bind.is_loopback() {
+            tracing::warn!(
+                "binding {addr} on a non-loopback address without authentication; \
+                 put an authenticating proxy in front before exposing it"
+            );
+        }
+
+        let path = if args.path.starts_with('/') {
+            args.path.clone()
+        } else {
+            format!("/{}", args.path)
+        };
+
+        let shared = Arc::clone(&self.backends);
+        let service: StreamableHttpService<RcaServer, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok(RcaServer::new(Arc::clone(&shared))),
+                Default::default(),
+                Default::default(),
+            );
+
+        let router = axum::Router::new().nest_service(&path, service);
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
+        let local = listener.local_addr().unwrap_or(addr);
+        // stderr, not stdout: stdout belongs to the stdio transport.
+        eprintln!("tiny-rca MCP listening on http://{local}{path} (streamable HTTP)");
+
+        axum::serve(listener, router)
+            .await
+            .map_err(|e| anyhow::anyhow!("server stopped: {e}"))
     }
 }
 

@@ -58,7 +58,10 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .build()?;
 
     runtime.block_on(async move {
-        let server = RcaServer::connect(args).await?;
+        let server = RcaServer::connect(args.clone()).await?;
+        if args.http {
+            return server.serve_http(args).await;
+        }
         let service = server.serve(stdio()).await?;
         service.waiting().await?;
         Ok::<(), anyhow::Error>(())

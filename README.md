@@ -42,18 +42,51 @@ cargo build --release                 # here
 # 1. index the code once (1.9s cold, 0.01s when unchanged)
 tinylink index ./MySolution -o tinylink.db
 
-# 2. serve
+# 2. serve — stdio, which is what an MCP client launches
 tiny-rca serve \
   --tinylink ../tinylink/target/release/tinylink \
   --index    tinylink.db \
   --pdg      ../tiny-pdg-cs/target/release/tiny-pdg-cs
 ```
 
-Point an MCP client at the binary over stdio.
-
 A backend that fails to start is reported by `capabilities` rather than aborting,
 so a partial setup still answers trace-level questions. Pass `--strict` to make
 any failure fatal.
+
+## Transports
+
+stdio or Streamable HTTP, on both sides. SSE is not offered: the MCP spec
+deprecated the standalone SSE transport and the Rust SDK ships no server for it.
+
+**tiny-rca as a client** — spawn the backends, or connect to ones already
+running:
+
+```bash
+# spawn (local agent)
+tiny-rca serve --tinylink ./tinylink --index tinylink.db --pdg ./tiny-pdg-cs
+
+# connect to shared servers (container, or one index for many agents)
+tiny-pdg-cs serve --http --port 8081
+tinylink      serve --http --port 8082 --index tinylink.db
+tiny-rca serve \
+  --tinylink-url http://127.0.0.1:8082/mcp \
+  --pdg-url     http://127.0.0.1:8081/mcp
+```
+
+Connecting by URL is the deployment that matters at scale: spawning a process per
+tiny-rca would reparse the whole solution each time, which is the cost the index
+exists to remove.
+
+**tiny-rca as a server** — `--http` exposes the same four tools remotely:
+
+```bash
+tiny-rca serve --tinylink-url http://127.0.0.1:8082/mcp --http --port 8080
+```
+
+Both sides bind loopback by default and log a warning on a non-loopback bind,
+because neither has authentication. The MCP authorization spec expects an OAuth
+flow that is not implemented here, so put an authenticating proxy in front
+before exposing either.
 
 ## Tools
 
