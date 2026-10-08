@@ -252,7 +252,7 @@ impl RcaServer {
 impl RcaServer {
     #[tool(
         name = "investigate_error",
-        description = "Start a root-cause investigation of a failed request. Give it an OTLP trace (inline JSON or a file path) and it returns every errored hop mapped to the handling method, file and line, plus the HTTP endpoint and how confident the mapping is. Start every incident here.",
+        description = "Start a root-cause investigation of a failed request. Give it an OTLP trace (inline JSON or a file path) and it returns every errored hop mapped to the handling method, file and line, plus the HTTP endpoint and how confident the mapping is. Start every incident here. Set include_runtime_paths=true to also get the runtime paths that ended in an exception, with the steps they take that the busiest healthy path for the same scope does not. Nothing in a trace records which branch of the code a request took; that comes from the path catalog the running service wrote, so it needs the telemetry server.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

@@ -127,6 +127,57 @@ exposing either.
 an agent does not have to guess a path through the toolset, and it flags
 low-confidence mappings explicitly.
 
+### The one thing worth combining
+
+Everything above answers from a trace: which service, which method, which line,
+which exception. **Nothing in a trace says which branch of the code got there.**
+That is recorded by the service's own instrumentation into the path catalog, and
+exists in no other place.
+
+`include_runtime_paths=true` closes that gap in one call:
+
+```jsonc
+{"name": "investigate_error", "arguments": {
+   "trace": "trace.json", "include_runtime_paths": true}}
+```
+
+```jsonc
+{"investigation": [{
+  "to": {"service": "AdNetwork.API",
+         "method": "GetConnectionsEndpoint.Handler",
+         "file": "AdNetwork.API/Endpoints/GetConnectionsEndpoint.cs", "line": 13,
+         "confidence": 0.95},
+  "trace_ids": ["01d90400000000000000000000000000"],
+  "runtime_paths": {
+    "trace": "01d90400000000000000000000000000",
+    "exceptionType": "System.IO.FileNotFoundException",
+    "pathIdsInThisTrace": ["19796"],
+    "paths": [
+      {"pathId": "40377", "scope": "Scope.Branch.Fail", "errorSpans": 248,
+       "sharedWithHealthyPath": "38232",
+       "sameStepsAsHealthyPath": true,
+       "readNext": "This path takes the same steps as the busiest healthy path for its scope, so the difference is not control flow. Compare what those steps returned, and the trace's logs, rather than the path itself."}]}}]}
+```
+
+So one answer carries the method that threw, the line it threw from, and the path
+through the code that reached it.
+
+Two things the answer is careful about:
+
+- **The paths are the general shape of the failure, not necessarily this request's
+  path.** `error_paths` searches across all traffic for everything that ended in this
+  exception. When the trace's own path id is among them the answer says so; when it is
+  not, it says that too and points at `path_diff` with the trace's own id. Silence there
+  would invite reading too much into the result.
+- **The exception type is discovered, not assumed.** The join key is read out of the
+  trace in the telemetry database. Filtering paths by the failing method name would be
+  the obvious shortcut and it is wrong: catalog scopes are instrumentation scopes and do
+  not match method names. A trace that threw more than one exception type is reported as
+  such — that is a dependency failing, not a code path.
+
+It costs two round trips per failing hop, so it is opt-in, and `next_steps` only
+suggests it when the telemetry server is connected and could answer.
+
 ### What it actually returns
 
 `capabilities` reports which backends are up and, importantly, what they expose —

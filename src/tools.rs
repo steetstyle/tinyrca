@@ -35,6 +35,14 @@ pub struct InvestigateArgs {
     /// How many log records to attach per trace.
     #[serde(default)]
     pub log_limit: Option<usize>,
+    /// Also fetch the runtime paths that ended in an exception, with the steps they
+    /// take that the busiest healthy path for the same scope does not.
+    ///
+    /// Off by default because it costs two round trips per failing hop, and only
+    /// the telemetry server can answer it. When it is on, each hop reports which
+    /// exception type it threw and which paths ended that way.
+    #[serde(default)]
+    pub include_runtime_paths: bool,
 }
 
 /// The incident entry point: trace in, mapped hops out.
@@ -123,6 +131,13 @@ pub async fn investigate_error(backends: &Arc<Backends>, args: InvestigateArgs) 
             }
         }
 
+        if args.include_runtime_paths {
+            item["runtime_paths"] = match runtime_paths_for(backends, &item).await {
+                Ok(value) => value,
+                Err(message) => json!({ "error": message }),
+            };
+        }
+
         if args.include_dependencies {
             if let Some(method) = target.as_deref() {
                 item["dependencies"] = match method_dependencies(
@@ -143,6 +158,9 @@ pub async fn investigate_error(backends: &Arc<Backends>, args: InvestigateArgs) 
         investigated.push(item);
     }
 
+    let mut steps = next_steps(&investigated);
+    add_path_step(&mut steps, backends, &investigated);
+
     Ok(json!({
         "investigation": investigated,
         "error_edge_count": edges.len(),
@@ -150,8 +168,129 @@ pub async fn investigate_error(backends: &Arc<Backends>, args: InvestigateArgs) 
         "total_traces": raw["total_traces"],
         "error_traces": raw["error_traces"],
         "unavailable_backends": backends.missing_report().await,
-        "next_steps": next_steps(&investigated),
+        "next_steps": steps,
     }))
+}
+
+/// Resolve one failing hop to the runtime paths that ended in an exception.
+///
+/// This is the join that makes the telemetry server worth connecting. Everything above
+/// this function works from a trace: which service, which method, which line. Nothing in
+/// a trace says which *branch* of the code got there — that is recorded by the service's
+/// own instrumentation and written to the path catalog, and exists nowhere else.
+///
+/// Two calls, because the join key has to be discovered rather than assumed. The first
+/// reads the trace out of the telemetry database to learn what it actually threw; the
+/// second finds every path that ended the same way and compares it against the busiest
+/// healthy path for its scope. Filtering paths by the hop's method name would be the
+/// obvious shortcut and it is wrong: catalog scopes are instrumentation scopes and do not
+/// match method names.
+async fn runtime_paths_for(backends: &Arc<Backends>, hop: &Value) -> Result<Value> {
+    let telemetry = backends.telemetry_required("include_runtime_paths")?;
+
+    let trace_id = hop["trace_ids"]
+        .as_array()
+        .and_then(|ids| ids.iter().filter_map(|v| v.as_str()).next())
+        .map(str::to_string);
+
+    let Some(trace_id) = trace_id else {
+        return Ok(json!({
+            "trace": Value::Null,
+            "note": "This hop carries no trace id, so there is nothing to look up. The \
+                     edge was mapped from the service graph rather than from a trace, \
+                     which happens when the parent hop's trace stopped at a service \
+                     boundary.",
+        }));
+    };
+
+    let trace = telemetry
+        .call(
+            "explain_trace",
+            json!({"traceId": trace_id, "maxSpans": 200}),
+        )
+        .await
+        .map_err(|e| format!("could not read trace {trace_id} from the telemetry server: {e}"))?;
+
+    // The dominant exception type is the join key. Most traces of a failing endpoint
+    // throw the same thing, and the one that throws most is the one worth chasing;
+    // a trace that throws several unrelated things has a dependency problem rather than
+    // a code path problem, and that shows up as a list rather than a single name.
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for span in trace["flat"].as_array().into_iter().flatten() {
+        let Some(kind) = span["exceptionType"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        match counts.iter_mut().find(|(k, _)| k == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind.to_string(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    let exception_types: Vec<String> = counts.iter().map(|(k, _)| k.clone()).collect();
+    let dominant = exception_types.first().cloned();
+
+    let Some(exception_type) = dominant else {
+        return Ok(json!({
+            "trace": trace_id,
+            "exceptionTypes": json!([]),
+            "paths": json!([]),
+            "note": "No span in this trace recorded an exception. Either the failure was \
+                     a status code with nothing thrown, or the exporter's exception \
+                     filter does not cover this type -- capture_coverage lists which \
+                     exceptions are recorded.",
+        }));
+    };
+
+    let paths = telemetry
+        .call(
+            "error_paths",
+            json!({"windowMinutes": 43200, "exceptionType": exception_type, "limit": 5}),
+        )
+        .await
+        .map_err(|e| format!("telemetry error_paths failed for {exception_type}: {e}"))?;
+
+    let mut out = json!({
+        "trace": trace_id,
+        "exceptionType": exception_type,
+        "exceptionTypes": exception_types,
+        "pathIdsInThisTrace": trace["paths"]
+            .as_array()
+            .map(|p| p.iter().filter_map(|v| v["pathId"].as_str()).collect::<Vec<_>>()),
+        "paths": paths["paths"].clone(),
+        "windowMinutes": 43200,
+    });
+
+    if exception_types.len() > 1 {
+        out["note"] = json!(
+            "This trace threw more than one exception type. The paths below are for the \
+             most frequent one; the others usually mean a dependency failed rather than \
+             this endpoint's own code."
+        );
+    }
+
+    // Say when the paths are not the ones this trace took. The catalog is across all
+    // traffic, so "the paths that throw X" is a broader question than "the path this
+    // request took", and an agent that does not know that will read too much into it.
+    let in_trace = out["pathIdsInThisTrace"].as_array().cloned().unwrap_or_default();
+    let matched = paths["paths"]
+        .as_array()
+        .map(|p| {
+            p.iter().any(|path| {
+                let wanted = path["pathId"].as_str().unwrap_or("");
+                in_trace.iter().any(|t| *t == wanted)
+            })
+        })
+        .unwrap_or(false);
+    if !in_trace.is_empty() && !matched {
+        out["note"] = json!(
+            "None of these paths is one this trace took, so they are the general shape \
+             of this failure rather than its specific route through the code. Use \
+             path_diff with the trace's own path id to narrow it."
+        );
+    }
+
+    Ok(out)
 }
 
 /// Tell the agent where to look next, so it does not have to guess a path
@@ -205,6 +344,33 @@ fn next_steps(edges: &[Value]) -> Vec<String> {
         );
     }
     steps
+}
+
+/// Add the runtime-path suggestion, but only when the telemetry server can answer it.
+///
+/// A next_steps entry that names a tool the server does not have is worse than no
+/// entry: an agent will spend a turn finding that out.
+fn add_path_step(steps: &mut Vec<String>, backends: &Arc<Backends>, edges: &[Value]) {
+    let Some(telemetry) = &backends.telemetry else {
+        return;
+    };
+    if !telemetry.has_tool("error_paths") || !telemetry.has_tool("explain_trace") {
+        return;
+    }
+    if !edges.iter().any(|e| {
+        e["trace_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty())
+    }) {
+        return;
+    }
+    steps.push(
+        "Call investigate_error with include_runtime_paths=true: which branch of the code \
+         this request actually took, and which steps it takes that the busiest healthy \
+         path does not. Nothing in a trace records that -- it comes from the path \
+         catalog the running service wrote."
+            .to_string(),
+    );
 }
 
 // ───────────────────────── explain_method ─────────────────────────
@@ -451,6 +617,7 @@ mod tests {
                 include_dependencies: false,
                 include_logs: false,
                 log_limit: None,
+                include_runtime_paths: false,
             },
         )
         .await
