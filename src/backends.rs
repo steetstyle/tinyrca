@@ -16,8 +16,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use rmcp::ErrorData as McpError;
 use rmcp::service::{NotificationContext, RequestContext, RunningService, Service, ServiceRole};
+use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt;
 use serde_json::Value;
 use tokio::process::Command;
@@ -257,7 +257,11 @@ impl McpLink {
             format!(
                 "{} server returned non-JSON from '{tool}': {e}. First bytes: {}",
                 self.name,
-                if head.is_empty() { "<empty>".to_string() } else { head }
+                if head.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    head
+                }
             )
         })
     }
@@ -272,7 +276,10 @@ async fn handshake<T, E, A>(
     transport: T,
     name: &str,
     endpoint: &Endpoint,
-) -> anyhow::Result<(RunningService<rmcp::RoleClient, PinnedVersion<()>>, Vec<rmcp::model::Tool>)>
+) -> anyhow::Result<(
+    RunningService<rmcp::RoleClient, PinnedVersion<()>>,
+    Vec<rmcp::model::Tool>,
+)>
 where
     T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,

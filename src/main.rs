@@ -11,6 +11,12 @@ struct Cli {
     command: Commands,
 }
 
+// Clippy wants the data-carrying variant boxed. It is right about the size and wrong
+// about the consequence: this enum is constructed once by clap, pattern-matched once,
+// and lives for the process. Boxing it would add an allocation and an indirection to
+// satisfy a heuristic that pays off only when a large enum is moved in a loop, which
+// this never is.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Start the MCP server (stdio), bridging tinylink and tiny-pdg-cs

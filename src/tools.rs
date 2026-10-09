@@ -272,7 +272,10 @@ async fn runtime_paths_for(backends: &Arc<Backends>, hop: &Value) -> Result<Valu
     // Say when the paths are not the ones this trace took. The catalog is across all
     // traffic, so "the paths that throw X" is a broader question than "the path this
     // request took", and an agent that does not know that will read too much into it.
-    let in_trace = out["pathIdsInThisTrace"].as_array().cloned().unwrap_or_default();
+    let in_trace = out["pathIdsInThisTrace"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let matched = paths["paths"]
         .as_array()
         .map(|p| {
@@ -357,11 +360,10 @@ fn add_path_step(steps: &mut Vec<String>, backends: &Arc<Backends>, edges: &[Val
     if !telemetry.has_tool("error_paths") || !telemetry.has_tool("explain_trace") {
         return;
     }
-    if !edges.iter().any(|e| {
-        e["trace_ids"]
-            .as_array()
-            .is_some_and(|ids| !ids.is_empty())
-    }) {
+    if !edges
+        .iter()
+        .any(|e| e["trace_ids"].as_array().is_some_and(|ids| !ids.is_empty()))
+    {
         return;
     }
     steps.push(
@@ -666,10 +668,7 @@ mod tests {
         .await
         .expect_err("still no server");
 
-        assert!(
-            err.contains("requested but did not start"),
-            "{err}"
-        );
+        assert!(err.contains("requested but did not start"), "{err}");
         assert!(
             !err.contains("--telemetry <dll>"),
             "a server that failed to start is not fixed by re-adding the flag: {err}"
@@ -834,10 +833,7 @@ pub struct TelemetryCallArgs {
 /// - `endpoint_health` — error rate and latency percentiles per route over live traffic
 /// - `capture_coverage` — what is configured to be recorded and when each table last got
 ///   a row; call this when anything else returns nothing
-pub async fn telemetry_call(
-    backends: &Arc<Backends>,
-    args: TelemetryCallArgs,
-) -> Result<Value> {
+pub async fn telemetry_call(backends: &Arc<Backends>, args: TelemetryCallArgs) -> Result<Value> {
     let telemetry = backends.telemetry_required(&args.tool)?;
     if !telemetry.has_tool(&args.tool) {
         let mut names = telemetry.tools().to_vec();
@@ -848,7 +844,9 @@ pub async fn telemetry_call(
             names.join(", ")
         ));
     }
-    telemetry.call(&args.tool, Value::Object(args.arguments)).await
+    telemetry
+        .call(&args.tool, Value::Object(args.arguments))
+        .await
 }
 
 // ───────────────────────── search_logs ─────────────────────────
@@ -905,21 +903,16 @@ pub async fn search_logs(backends: &Arc<Backends>, args: SearchLogsArgs) -> Resu
     match source {
         "store" => search_logs_in_store(backends, args).await,
         "database" => search_logs_in_database(backends, args).await,
-        other => {
-            return Err(format!(
-                "unknown log source '{other}'. Use 'store' for OTLP payloads ingested \
-                 into tinylink, or 'database' for the deployment's telemetry database. \
-                 Run capabilities to see which are available."
-            ))
-        }
+        other => Err(format!(
+            "unknown log source '{other}'. Use 'store' for OTLP payloads ingested into \
+             tinylink, or 'database' for the deployment's telemetry database. Run \
+             capabilities to see which are available."
+        )),
     }
 }
 
 /// Search the OTLP payloads ingested into tinylink's store.
-async fn search_logs_in_store(
-    backends: &Arc<Backends>,
-    args: SearchLogsArgs,
-) -> Result<Value> {
+async fn search_logs_in_store(backends: &Arc<Backends>, args: SearchLogsArgs) -> Result<Value> {
     let link = backends.link_required("search_logs")?;
 
     let mut payload = serde_json::Map::new();
@@ -965,10 +958,7 @@ async fn search_logs_in_store(
 /// `trace_id` and `min_severity` from the OTLP store should not have to learn a second
 /// vocabulary for the same question, and the telemetry server's own tool names are not
 /// an agent-facing contract.
-async fn search_logs_in_database(
-    backends: &Arc<Backends>,
-    args: SearchLogsArgs,
-) -> Result<Value> {
+async fn search_logs_in_database(backends: &Arc<Backends>, args: SearchLogsArgs) -> Result<Value> {
     let telemetry = backends.telemetry_required("search_logs")?;
 
     // The database stores nanoseconds as a plain integer column and takes the window as
@@ -983,7 +973,10 @@ async fn search_logs_in_database(
         })
         .unwrap_or(60 * 24);
 
-    let level = args.min_severity.as_deref().and_then(severity_to_database_name);
+    let level = args
+        .min_severity
+        .as_deref()
+        .and_then(severity_to_database_name);
 
     let payload = json!({
         "windowMinutes": window_minutes,

@@ -574,7 +574,10 @@ fn capabilities_advertises_log_search_and_how_to_load_it() {
     // With only tinylink connected, the OTLP store is the available source and the
     // database one is reported as unavailable rather than implied.
     assert_eq!(caps["log_sources"]["store"]["available"], true, "{caps}");
-    assert_eq!(caps["log_sources"]["database"]["available"], false, "{caps}");
+    assert_eq!(
+        caps["log_sources"]["database"]["available"], false,
+        "{caps}"
+    );
     assert_eq!(caps["can_resolve_runtime_paths"], false, "{caps}");
     assert!(
         caps["log_guidance"]

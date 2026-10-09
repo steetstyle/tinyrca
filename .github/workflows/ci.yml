@@ -44,7 +44,11 @@ jobs:
 
       - name: Build tinylink
         working-directory: tinylink
-        run: cargo build --release --features mcp
+        # mcp-http, not mcp: tests/http_test.rs drives `tinylink serve --http` as a
+        # shared backend, and that transport is behind its own feature. With only
+        # `mcp` the binary answers "serve --http requires the mcp-http feature" and the
+        # test fails on a server that built fine.
+        run: cargo build --release --features mcp-http
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings

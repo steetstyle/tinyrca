@@ -116,11 +116,13 @@ impl ServeArgs {
                 url: url.as_str().into(),
             });
         }
-        self.telemetry.as_ref().map(|dll| backends::Endpoint::Stdio {
-            binary: std::path::PathBuf::from("dotnet"),
-            args: vec![dll.display().to_string()],
-            env: Vec::new(),
-        })
+        self.telemetry
+            .as_ref()
+            .map(|dll| backends::Endpoint::Stdio {
+                binary: std::path::PathBuf::from("dotnet"),
+                args: vec![dll.display().to_string()],
+                env: Vec::new(),
+            })
     }
 
     fn pdg_endpoint(&self) -> Option<backends::Endpoint> {
