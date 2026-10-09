@@ -312,6 +312,27 @@ impl RcaServer {
             .map_err(to_mcp)
     }
 
+    /// Nested single-entry, single-exit regions of a method.
+    #[tool(
+        name = "method_hammocks",
+        description = "Restructure a method into hammock blocks: nested single-entry, single-exit regions, where a loop body sits inside a conditional inside the method. Returns a containment forest, so each region names its parent and its depth — which is what lets a traversal zoom back out after it has gone too deep. Prefer this to method_dependencies when the question is which structured region a symptom falls in: far fewer and larger regions, and the parent link is what a flat PDG cannot give.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn method_hammocks(
+        &self,
+        args: Parameters<tools::HammocksArgs>,
+    ) -> Result<String, McpError> {
+        tools::method_hammocks(&self.backends, args.0)
+            .await
+            .map(render)
+            .map_err(to_mcp)
+    }
+
     /// Search the log store.
     #[tool(
         name = "search_logs",
@@ -447,6 +468,7 @@ mod tests {
             "investigate_error",
             "explain_method",
             "method_dependencies",
+            "method_hammocks",
             "search_logs",
             "ingest_logs",
             "telemetry_call",
@@ -454,7 +476,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 7, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 8, "unexpected tool set: {names:?}");
     }
 
     #[test]

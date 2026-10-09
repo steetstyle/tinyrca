@@ -41,6 +41,7 @@ fn main() {
                 "investigate_error",
                 "explain_method",
                 "method_dependencies",
+                "method_hammocks",
                 "search_logs",
                 "ingest_logs",
                 "telemetry_call",

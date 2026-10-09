@@ -342,6 +342,7 @@ async fn tiny_rca_over_http_exposes_the_same_tools_as_stdio() {
             "ingest_logs",
             "investigate_error",
             "method_dependencies",
+            "method_hammocks",
             "search_logs",
             "telemetry_call"
         ],

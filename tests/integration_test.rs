@@ -244,6 +244,7 @@ fn tiny_rca_lists_only_its_own_tools() {
             "ingest_logs",
             "investigate_error",
             "method_dependencies",
+            "method_hammocks",
             "search_logs",
             "telemetry_call"
         ],

@@ -478,6 +478,58 @@ pub async fn method_dependencies(
     .await
 }
 
+// ───────────────────────── method_hammocks ─────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct HammocksArgs {
+    /// `Class.Method`.
+    pub target: String,
+    /// Directory holding the sources, required by the code-analysis server.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Report only regions with at least this many blocks. 2 is the definition's floor.
+    #[serde(default)]
+    pub min_blocks: Option<usize>,
+}
+
+/// The hammock blocks of a method, as a nested containment forest.
+///
+/// Delegates to tiny-pdg-cs, which owns their construction. Prefer this to
+/// `method_dependencies` when the question is which structured region a symptom falls
+/// in: it returns far fewer and larger regions, and each names its parent, which is what
+/// lets a traversal zoom back out after it has gone too deep. A flattened PDG has no
+/// such way back.
+pub async fn method_hammocks(backends: &Arc<Backends>, args: HammocksArgs) -> Result<Value> {
+    let pdg = backends.pdg_required("method_hammocks")?;
+
+    let path = args.path.as_deref().ok_or_else(|| {
+        format!(
+            "method_hammocks needs `path` (the C# source directory). \
+             {} has no configured source root; pass the directory to analyse.",
+            pdg.name()
+        )
+    })?;
+
+    let (class, method) = args.target.split_once('.').ok_or_else(|| {
+        format!(
+            "target must be Class.Method, got '{}' — \
+             an unqualified name cannot be resolved to regions",
+            args.target
+        )
+    })?;
+
+    pdg.call(
+        "method_hammocks",
+        json!({
+            "path": path,
+            "class": class,
+            "method": method,
+            "min_blocks": args.min_blocks,
+        }),
+    )
+    .await
+}
+
 // ───────────────────────── capabilities ─────────────────────────
 
 /// What is connected, what it can do, and what is missing.
