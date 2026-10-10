@@ -766,6 +766,30 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use crate::backends::{decode_tool_answer, wrap_prose_answer};
+
+    /// A search that matched nothing must come back as an empty result set, not as a
+    /// transport failure.
+    ///
+    /// The telemetry server answers "No rows matched: routes with at least 20 requests
+    /// ..." in prose, and requiring JSON turned that into an error naming the transport.
+    /// The caller of a search wants a set, so the set is empty here and the server's
+    /// explanation is kept beside it -- it usually names the threshold that hid the rows.
+    #[test]
+    fn an_unmatched_database_search_is_an_empty_result_not_a_failure() {
+        let server_said = "No rows matched: logs with at least 1 requests in the last 60 minutes.";
+        let prose = wrap_prose_answer(server_said.to_string());
+
+        assert!(
+            prose.get("text").is_some(),
+            "the wrapper carries the answer"
+        );
+        assert!(
+            decode_tool_answer(server_said.to_string()).is_err(),
+            "and it is prose, which the JSON path would have rejected"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1152,6 +1176,34 @@ async fn search_logs_in_store(backends: &Arc<Backends>, args: SearchLogsArgs) ->
 /// `trace_id` and `min_severity` from the OTLP store should not have to learn a second
 /// vocabulary for the same question, and the telemetry server's own tool names are not
 /// an agent-facing contract.
+/// The answer for a database search that matched nothing, in the shape a populated one
+/// has.
+///
+/// Two things this has to get right, both of them found by driving the chain rather than
+/// by reading it:
+///
+/// * It is a result set, not prose. The telemetry server answers a search with no
+///   matches in a sentence -- "No rows matched: logs at Error or above in the last 1440
+///   minutes" -- and requiring JSON turned that correct answer into a failure naming the
+///   transport. The server's sentence is kept as `server_said`, because it usually names
+///   the threshold that hid the rows and that is the useful part.
+///
+/// * The records key is `logs`, the same one the populated answer carries, because that
+///   is the key the server serialises on a hit. A tool that changes shape when the answer
+///   is empty gives its callers no way to tell an empty result from a shape they did not
+///   recognise: the traversal layer was measured reading zero logs out of a search that
+///   had actually succeeded.
+fn empty_database_answer(server_text: String) -> Value {
+    json!({
+        "source": "database",
+        "logs": [],
+        "returned": 0,
+        "total_matched": 0,
+        "note": "Nothing in the telemetry database matched. Its answer is below.",
+        "server_said": server_text,
+    })
+}
+
 async fn search_logs_in_database(backends: &Arc<Backends>, args: SearchLogsArgs) -> Result<Value> {
     let telemetry = backends.telemetry_required("search_logs")?;
 
@@ -1184,7 +1236,16 @@ async fn search_logs_in_database(backends: &Arc<Backends>, args: SearchLogsArgs)
         "minimumLevel": level,
     });
 
-    let mut out = telemetry.call("search_logs", payload).await?;
+    // call_raw, not call: this server answers in prose when nothing matches, and
+    // "No rows matched: ..." is the correct answer to a search that found nothing.
+    // Requiring JSON turned it into a failure that named the transport instead.
+    let mut out = telemetry.call_raw("search_logs", payload).await?;
+
+    if out.get("text").is_some() && out.get("note").is_some() {
+        return Ok(empty_database_answer(
+            out["text"].as_str().unwrap_or_default().to_string(),
+        ));
+    }
 
     // The database's rows are a different shape from the store's, so the answer says
     // which shape it is rather than leaving the caller to notice that `body` is missing.

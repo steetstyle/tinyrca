@@ -320,7 +320,7 @@ impl McpLink {
 ///
 /// Split out from the two callers so it can be tested without a server: the decision is
 /// "is this JSON or not", and that is the whole of what differs between them.
-fn decode_tool_answer(text: String) -> Result<Value, String> {
+pub(crate) fn decode_tool_answer(text: String) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|e| {
         let head: String = text.chars().take(200).collect();
         format!(
@@ -337,7 +337,7 @@ fn decode_tool_answer(text: String) -> Result<Value, String> {
 /// routes with at least 20 requests ..." for an empty result. That is a correct answer,
 /// and requiring JSON turns it into a failure that reads like a transport problem and
 /// points whoever is reading it at the wrong thing.
-fn wrap_prose_answer(text: String) -> Value {
+pub(crate) fn wrap_prose_answer(text: String) -> Value {
     serde_json::json!({
         "text": text,
         "note": "this tool answered in prose rather than JSON, and it is passed through \
