@@ -691,11 +691,81 @@ span_toplam  hatali_span
 
 ---
 
+#### Temizlik, ikinci tur — `/api/member/`
+
+Kapsam genişletildi: ana log partisi de silinecek.
+
+**Sorgu (silinecek):**
+
+```
+SELECT countIf(endpoint LIKE '/api/member/%')    → 470.653
+       count()                                    → 470.659
+       kalacak                                    →      6
+       istisna olanlar içinde                     →      0
+```
+
+**Sorgu (silineceklerin ne olduğu):**
+
+```
+message:           synthetic log line 342976
+formatted_message: Handler 8 synthetic log line 342976
+properties:        {"TenantId":"tenant-1"}
+```
+
+Üreticinin çıktısı — hepsi sentetik.
+
+**Sorgu (kalacak 6 satır gerçek mi):**
+
+`endpoint NOT LIKE '/api/member/%'` **boş döndü**, çünkü `endpoint IS NULL` olan
+satırlarda `NOT LIKE` NULL verir ve üç-değerli mantıkta elenir. `endpoint IS NULL OR
+...` ile tekrar soruldu: 6 satır, hepsi şu:
+
+```
+Telemetry filter refreshed: mode={Mode}, rootsOnly={RootsOnly}, traceFull=…
+```
+
+**Kaynağı bulundu** — üretici değil, gerçek kod:
+
+```
+$ grep -rn "Telemetry filter refreshed" --include=*.cs .
+./Infrastructure.Telemetry.Core/TelemetryFilter.cs:390
+```
+
+`{Mode}` gibi şablon yer tutucularının görünmesi de bunu doğruluyor: .NET exporter
+gövdeyi işlenmemiş şablon olarak yolluyor, bu da tinylink'in dokümanında yazılı.
+
+**Sorgu (sentetik işaret kalmış mı):**
+
+```
+sentetik_kelime  rare_kelime  formatted_sentetik  toplam
+0                0            0                  6
+```
+
+**Sorgu (uygulama):**
+
+```
+ALTER TABLE telemetry.log DELETE WHERE endpoint LIKE '/api/member/%'
+SETTINGS mutations_sync = 2
+→ hata yok
+```
+
+**Sonuç (doğrulama):**
+
+```
+kalan_log  kalan_member  kalan_rare  kalan_istisna  kalan_sentetik
+6          0             0           0              0
+```
+
+`telemetry.log` artık tamamen gerçek: 6 satır, hepsi telemetri sunucusunun kendi
+işletim kaydı.
+
+---
+
 ### Silme sonrası bu veritabanının durumu
 
 | tablo | durum |
 |---|---|
-| `telemetry.log` | 470.659 log, **hiçbiri istisna değil** |
+| `telemetry.log` | **6 log** — hepsi telemetri sunucusunun kendi işletim kaydı, sentetik değil |
 | `telemetry.trace` | 2.000.012 span, 87.671'i sentetik işaretli hata |
 | `telemetry.baggage` | 4.500.000 satır — **dokunulmadı** |
 | `telemetry.path` / `path_step` / `trace_path` | dokunulmadı |
