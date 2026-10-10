@@ -355,9 +355,9 @@ Bunlar aynı seansta ölçüldü ama ayrı kök nedenleri var; ayrı kayıt olma
 
 ### Doğrulanmamış kalanlar
 
-- **`Npgsql.PostgresException` loglarının trace'e bağlanmamasının sebebi** araştırılmadı.
-  50.000 kayıt sorgulanabilir ama hiçbiri incelenemiyor. Veri üretim kaynaklı
-  görünüyor, kök nedeni bu kayıtta belirlenmedi.
+- **`Npgsql.PostgresException` loglarının trace'e bağlanmaması** → çözüldü, bak
+  [INC-0003](#inc-0003). Üretici bu 50.000 kaydın id'sini 9 milyon kaydırmış, yani
+  span'la eşleşmeleri tasarım gereği imkânsız. Kayıtlar 2026-10-10'da silindi.
 - **Çalışan servislerin neden enstrümente olmadığı** (`Agency.API.csproj` yalnızca
   `Rougamo.Fody` referanslı) ayrı bir konu; canlı log toplama imkânını etkiliyor.
 - **`TINYLINK_LOG_STORE` ortam değişkeni** ayrıntılı incelenmedi; MCP sunucusu bu
@@ -505,5 +505,219 @@ depo yolunun bildirilmesi.
 - **Aynı içerik, iki ayrı gerçek olay** olduğunda tekilleştirme onları birleştirir.
   `observed_unix_nano` ve `span_id` fingerprint'e girdiği için aynı istek içinde
   çift kayıt olmadıkça risk düşük; ölçülmedi.
-- **`Npgsql.PostgresException`** (50.000 kayıt) trace'e bağlanmıyor; sebebi
-  araştırılmadı.
+- **`Npgsql.PostgresException`** çözüldü → [INC-0003](#inc-0003).
+---
+
+<a id="inc-0003"></a>
+## INC-0003 — Sentetik veri: köken doğrulaması ve temizlik
+
+**Durum:** düzeltildi (log tablosu), kapsam bilinçli olarak daraltıldı
+**Tarih:** 2026-10-10
+**Kapsam:** ClickHouse `telemetry` veritabanı
+
+---
+
+### Problem
+
+`inc-0001` incelenirken "bu veri sentetik" denildi — ama o oturumda doğrulanmamıştı.
+Dayanak, veritabanındaki kelimenin kendisiydi (`synthetic failure for index
+measurement`). **Yeterli değil:** bir veritabanına `"synthetic"` yazan biri elbette
+sentetik yazar.
+
+---
+
+### Yeniden üretim (üç bağımsız kanıt)
+
+**Kanıt 1 — üretici betik diskte, verinin üretildiği gün.**
+
+```
+$ find / -name "gen_volume*"
+/tmp/opencode/gen_volume.py          13.900 bayt   2026-10-08 23:18
+
+ClickHouse max timestamp                            2026-10-08 19:51
+```
+
+**Kanıt 2 — betiğin metinleri veritabanıyla birebir aynı.**
+
+| `gen_volume.py` | veritabanında ölçülen |
+|---|---|
+| `'Npgsql.PostgresException', 'rare failure', '   at Rare.Handler() in /srv/Rare.cs:line 7'` | aynen |
+| `concat('rare occurrence 4242 for token ', number)` | `rare occurrence 4242 for token 16333` |
+| `'synthetic failure for index measurement'` | aynen |
+| `'/api/rare'`, `'/api/member/'` | aynen |
+
+**Kanıt 3 — aritmetik, id'leri birebir üretiyor.** En güçlüsü bu: metin eşleşmesi
+kopyalanabilir, sayı eşleşmesi kopyalanamaz.
+
+Üreticinin formülü, ClickHouse'ta çalıştırıldı:
+
+```
+SELECT number, lower(hex(reinterpretAsFixedString(toUInt128(number + 9000000 + 1))))
+FROM numbers(3) FORMAT TSVWithNames
+
+sayi  uretilen
+0      41548900000000000000000000000000
+1      42548900000000000000000000000000
+```
+
+`0x00895441` = **9.000.001**. Formül gerçek.
+
+---
+
+### Kök neden (INC-0001'deki açık madde): Npgsql logları neden trace'e bağlanmıyor
+
+**Sorgu:**
+
+```
+SELECT exception_type, count(), uniqExact(trace_id),
+       countIf(trace_id='') FROM telemetry.log
+WHERE exception_type IS NOT NULL GROUP BY 1
+```
+
+**Sonuç:**
+
+| exception_type | adet | trace_id boş | farklı trace_id |
+|---|---|---|---|
+| `Npgsql.PostgresException` | 50.000 | 0 | 50.000 |
+| `System.InvalidOperationException` | 29.347 | 0 | 29.347 |
+
+**Sonuç:** id'ler boş değil — **yazılmamış**.
+
+**Sorgu (kesisim):**
+
+```
+SELECT count() FROM telemetry.trace t INNER JOIN
+  (SELECT DISTINCT trace_id FROM telemetry.log
+   WHERE exception_type='Npgsql.PostgresException') l ON t.trace_id=l.trace_id
+→ 0
+```
+
+**Kök neden — üreticinin kaydırması:**
+
+| küme | formül | aralık |
+|---|---|---|
+| span'lar (2.000.000) | `number + 1` | 1 … 2.000.000 |
+| loglar (500.000) | `number + 1` | 1 … 500.000 ← span aralığının **içinde** |
+| Npgsql logları (50.000) | `number + 9.000.001` | 9.000.001 … 9.050.000 ← **dışında** |
+
+Logların `trace_id`'si span aralığının içinde olduğu için 29.347'si eşleşiyor;
+Npgsql'ınki 9 milyon kaydırıldığı için **hiçbiri eşleşemiyor**.
+
+**Bu bir veri kalitesi kazası değil, üreticinin bilinçli bir tercihi:** onları
+izlenebilir olmaktan çıkarmış.
+
+** güven : yüksek.** Üç bağımsız kanıt, aritmetik dâhil.
+
+---
+
+### Temizlik
+
+**Sorgu (kapsam ölçümü — her işaretin kaç satıra dokunduğu):**
+
+```
+SELECT
+  countIf(exception_type='Npgsql.PostgresException')     →  50.000
+  countIf(exception_message='rare failure')             →  50.000
+  countIf(position(exception_stacktrace,'Rare.Handler')>0) → 50.000
+  countIf(position(message,'rare occurrence')>0)        →  50.000
+  countIf(endpoint='/api/rare')                         →  50.000
+  countIf(endpoint LIKE '/api/member/%')                → 500.000   ← ana partinin TAMAMI
+  countIf(exception_message='synthetic failure...')     →  29.347
+  count()                                                → 550.006
+```
+
+**Ölçüm iki şeyi ortaya çıkardı, ikisi de karar öncesi bildirildi:**
+
+1. `/api/member/` yalnızca istisna loglarını değil, **ana log partisinin 500.000
+   satırının tamamını** işaretliyor.
+2. `trace` tablosundaki **87.671 hatalı span'ın hepsi** sentetik işaretli.
+
+**Karar (kullanıcı):** yalnızca istisna logları, `/api/member/` hariç.
+`trace` tablosuna dokunulmadı.
+
+**Sorgu (WHERE'in tam olarak ne sileceğini doğrulama):**
+
+```
+SELECT count() FROM telemetry.log WHERE
+  exception_type = 'Npgsql.PostgresException'
+  OR exception_message = 'rare failure'
+  OR position(exception_stacktrace,'Rare.Handler') > 0
+  OR position(message,'rare occurrence') > 0
+  OR endpoint = '/api/rare'
+  OR exception_message = 'synthetic failure for index measurement'
+→ 79.347
+```
+
+Bu, `exception_type IS NOT NULL` ile ölçülen sayıyla **birebir aynı** — yani
+predicate fazlasını değil, tam olarak istisna loglarını kapsıyor.
+
+**Sorgu (yazma izni doğrulama, geri alınamaz işlem öncesi):**
+
+```
+SELECT command, is_done FROM system.mutations
+→ DELETE WHERE (kind_id = 9) ... is_done = 1     (önceki mutasyonlar çalışmış)
+```
+
+**Sorgu (uygulama):**
+
+```
+ALTER TABLE telemetry.log DELETE WHERE <yukarıdaki predicate>
+SETTINGS mutations_sync = 2
+→ hata yok
+```
+
+**Sonuç (doğrulama):**
+
+```
+kalan_log  kalan_istisna  kalan_api_rare  kalan_rare_occurrence  kalan_sentetik
+470.659    0              0               0                      0
+```
+
+**Sorgu (kalanın ne olduğu):**
+
+```
+normal_log (/api/member/*)  470.653
+işletim logu (endpoint NULL)      6   ← Telemetry.Mcp.Server'ın kendi kaydı, sentetik DEĞİL
+```
+
+**Sorgu (trace tablosu dokunulmadı mı):**
+
+```
+span_toplam  hatali_span
+2.000.012    87.671
+```
+
+**Değişmedi** — karar gereği.
+
+---
+
+### Silme sonrası bu veritabanının durumu
+
+| tablo | durum |
+|---|---|
+| `telemetry.log` | 470.659 log, **hiçbiri istisna değil** |
+| `telemetry.trace` | 2.000.012 span, 87.671'i sentetik işaretli hata |
+| `telemetry.baggage` | 4.500.000 satır — **dokunulmadı** |
+| `telemetry.path` / `path_step` / `trace_path` | dokunulmadı |
+
+**Bu veritabanıyla istisna araştırması artık yapılamaz.** Log tablosunda istisna
+kalmadı; hatalı span'lar duruyor ama eşleşen logları yok — yani
+`search_logs source=database` bir hata döndüğünde görececek kayıt bulamaz.
+
+---
+
+### Doğrulanmamış kalanlar
+
+- **`baggage`, `path`, `path_step`, `trace_path` tabloları da sentetik** (aynı
+  betikten çıktı) ama kullanıcı listelemediği için silinmedi. Sırasıyla
+  4.500.000 / 50.000 / 400.000 / 50.000 satır.
+- **`trace` tablosundaki 87.671 hatalı span** sentetik işaretli ve silinmedi —
+  bilinçli, karar gereği.
+- **Genetik isimlendirme**: `Npgsql.PostgresException` bir .NET/PostgreSQL sınıfı
+  adı, `/srv/Rare.cs` Linux yolu, `at Rare.Handler() in /srv/Rare.cs:line 7` C#
+  stack izimi. `/srv/` altında C# kaynağı olamaz — bu da tek başına sentetik
+  olduğunun göstergesi, ama kanıt değil.
+- **Çalışan servisler hâlâ enstrümente değil.** Bunun sebebi araştırılmadı;
+  ölçülen şu: `Agency.API.csproj` yalnızca `Rougamo.Fody` referanslı,
+  `OpenTelemetry` yalnızca `Infrastructure.Telemetry.Benchmarks` içinde,
+  4317/4318 dinleyen yok.
