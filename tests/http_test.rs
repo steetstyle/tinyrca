@@ -334,18 +334,17 @@ async fn tiny_rca_over_http_exposes_the_same_tools_as_stdio() {
     let tools = service.list_all_tools().await.expect("list tools");
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
+    // LISTED_TOOLS, not a list written here. This test is about the HTTP transport not
+    // losing tools, and it cannot tell a lost tool from an added one when the expected
+    // side is a hand-kept list: it stayed at eight through the addition of diff_impact
+    // and then search_github, and kept reporting a green run of everything else.
+    let mut expected: Vec<String> = tiny_rca::LISTED_TOOLS
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+    expected.sort();
     assert_eq!(
-        names,
-        vec![
-            "capabilities",
-            "explain_method",
-            "ingest_logs",
-            "investigate_error",
-            "method_dependencies",
-            "method_hammocks",
-            "search_logs",
-            "telemetry_call"
-        ],
+        names, expected,
         "HTTP must expose the same tools as stdio: {names:?}"
     );
 

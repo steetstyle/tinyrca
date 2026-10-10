@@ -142,11 +142,47 @@ fn backend_binaries() -> Option<(PathBuf, PathBuf)> {
     let pdg = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()?
         .join("tiny-pdg-cs/target/release/tiny-pdg-cs");
-    if tinylink.exists() && pdg.exists() {
-        Some((tinylink, pdg))
-    } else {
-        None
+    if !tinylink.exists() || !pdg.exists() {
+        return None;
     }
+
+    // Existence is not enough, and the difference matters. A binary that is not built at
+    // all is an environment difference, and skipping is right. A binary that is built
+    // without its feature is a mistake in the working tree: it exits at once, and the
+    // handshake reports that as "connection closed: initialize response" -- a message
+    // about the transport when the fault is a missing cargo flag.
+    //
+    // So the second case fails, loudly and with the command to run. It did not skip
+    // first: a skipped test prints nothing unless `--nocapture` is passed, which would
+    // have replaced a confusing failure with an invisible one.
+    for (bin, feature) in [(&tinylink, "mcp-http"), (&pdg, "mcp")] {
+        if let Some(reason) = missing_feature(bin) {
+            panic!(
+                "{} cannot serve: {reason}\n\
+                 Build it with the feature: cargo build --release --features {feature}\n\
+                 (a bare `cargo build --release` leaves a binary that exits on startup)",
+                bin.display()
+            );
+        }
+    }
+
+    Some((tinylink, pdg))
+}
+
+/// Why this binary cannot serve, if it cannot.
+///
+/// Runs `serve` with stdin closed and reads the complaint. Cheap either way: without the
+/// feature it exits at once on the flag check, and with it, on end of input. Which
+/// feature it wanted is in the message, so nothing has to be passed in.
+fn missing_feature(bin: &Path) -> Option<String> {
+    let out = Command::new(bin)
+        .arg("serve")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr.lines().find(|l| l.contains("requires"))?;
+    Some(line.trim().to_string())
 }
 
 /// Build a C# project and the tinylink index for it.
@@ -236,18 +272,13 @@ fn tiny_rca_lists_only_its_own_tools() {
         .collect();
     // The server lists tools alphabetically; compare as a set.
     names.sort_unstable();
+    // LISTED_TOOLS, not a list written here. A hand-kept list cannot tell a lost tool
+    // from an added one, and this one sat at eight through the addition of diff_impact
+    // and then search_github while every other test in the file reported itself green.
+    let mut expected: Vec<&str> = tiny_rca::LISTED_TOOLS.to_vec();
+    expected.sort_unstable();
     assert_eq!(
-        names,
-        vec![
-            "capabilities",
-            "explain_method",
-            "ingest_logs",
-            "investigate_error",
-            "method_dependencies",
-            "method_hammocks",
-            "search_logs",
-            "telemetry_call"
-        ],
+        names, expected,
         "tiny-rca should expose its bridging tools, not duplicate the backends': {names:?}"
     );
 }
