@@ -19,7 +19,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -29,24 +31,31 @@ jobs:
       # The backends are separate crates in sibling directories; tiny-rca's
       # integration test drives the real binaries, so it needs release builds of
       # both. Checkout them alongside.
+      # Siblings, not subdirectories. Cargo.toml points at `../tinylink`, because that
+      # is where it sits locally; checking the two repositories out *inside* the crate
+      # put tinylink at <workspace>/tinylink while cargo looked in <workspace>/../tinylink,
+      # and the build stopped with "no matching package named `tinylink` found".
+      #
+      # Matching the local layout also means the integration test drives the binaries the
+      # same way a developer does.
       - name: Check out tiny-pdg-cs
         uses: actions/checkout@v4
         with:
           repository: steetstyle/tinypdg-cs
-          path: tiny-pdg-cs
+          path: ../tiny-pdg-cs
 
       - name: Check out tinylink
         uses: actions/checkout@v4
         with:
           repository: steetstyle/tinylink
-          path: tinylink
+          path: ../tinylink
 
       - name: Build tiny-pdg-cs
-        working-directory: tiny-pdg-cs
+        working-directory: ../tiny-pdg-cs
         run: cargo build --release --features mcp
 
       - name: Build tinylink
-        working-directory: tinylink
+        working-directory: ../tinylink
         # mcp-http, not mcp: tests/http_test.rs drives `tinylink serve --http` as a
         # shared backend, and that transport is behind its own feature. With only
         # `mcp` the binary answers "serve --http requires the mcp-http feature" and the

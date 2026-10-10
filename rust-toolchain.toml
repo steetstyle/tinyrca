@@ -1,0 +1,12 @@
+# Pinned, because the gates are version-sensitive and were not reproducible without it.
+#
+# CI installed `stable`, which moves. Two ways that showed up: clippy flagged seven
+# lints on 1.99 that 1.94 does not have, and a `check` job with `RUSTFLAGS: -D warnings`
+# turns every one of them into a red build that has nothing to do with the commit. It is
+# not reproducible to say "run the gates" when the gates differ by the morning's release.
+#
+# rustup installs this automatically; there is nothing to add to a contributor's setup
+# beyond having rustup.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
