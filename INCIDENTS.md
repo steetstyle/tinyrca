@@ -761,14 +761,91 @@ işletim kaydı.
 
 ---
 
+---
+
+#### Temizlik, üçüncü tur — altı tablo
+
+**Sorgu (kapsam ölçümü, üreticinin yazdığı yerler):**
+
+```
+$ grep -nE "INSERT INTO telemetry\." gen_volume.py
+122:  telemetry.trace      181: telemetry.log       221: telemetry.baggage
+251:  telemetry.trace_path 278: telemetry.trace_path_step  298: telemetry.log
+```
+
+`path`, `path_step`, `metric` yazılmamış — **View** oldukları için ölçümde çıktı:
+
+```
+name              engine
+path              View          → SELECT * FROM telemetry.trace_path
+path_step         View          → SELECT * FROM telemetry.trace_path_step
+trace_path        AggregatingMergeTree
+trace_path_step   ReplacingMergeTree
+```
+
+**Sorgu (silinecek satırlar):**
+
+```
+tablo            silinecek    toplam
+trace            2.000.000    2.000.012
+trace_path          50.000       50.000
+path                50.000       50.000
+path_step          400.000      400.000
+```
+
+`trace` için 12 satır **korundu**: `/api/x/` işareti taşımayan tek 12 span. Bunlar
+`POST http://localhost:8123/` — telemetri sunucusunun kendi ClickHouse çağrıları,
+zamanları kalan log satırlarıyla birebir aynı (`19:51:59`, `19:46:59`).
+
+**Sorgu (path_step'in sahte olduğunun bağımsız kanıtı):**
+
+```
+farkli dosya yolu: 1.500   →  /srv/Service0…6/Handler0…499.cs
+$ ls -d unicpeak-analytics-api/*/srv   →  yok
+```
+
+**Sorgu (uygulama ve doğrulama):**
+
+```
+ALTER TABLE telemetry.trace           DELETE WHERE position(attributes,'/api/x/')>0 …
+                                        → kalan: 12
+ALTER TABLE telemetry.trace_path      DELETE WHERE position(scope_name,'Scope.')=1   → 0
+ALTER TABLE telemetry.trace_path_step DELETE WHERE position(file_path,'/srv/Service')=1 → 0
+```
+
+`path` ve `path_step` mutasyon hatası verdi — **View**'lar mutasyon desteklemiyor.
+Altındaki tablolar boşalınca view'lar da boşaldı, ayrı işlem gerekmedi.
+
+**Son durum:**
+
+```
+log                6      ← 6 gerçek işletim logu kaldı
+trace             12      ← 12 gerçek işletim span'i kaldı
+metric          2.470      ← silinmedi, aşağıda
+baggage       4.500.000    ← silinmedi, aşağıda
+path                 0
+path_step            0
+trace_path           0
+trace_path_step      0
+trace_path_new       0
+```
+
+**Sorgu (son tarama):**
+
+```
+log_sentetik  trace_sentetik  baggage_sentetik  metric_toplam
+0             0               2.250.000         2.470
+```
+
 ### Silme sonrası bu veritabanının durumu
 
 | tablo | durum |
 |---|---|
-| `telemetry.log` | **6 log** — hepsi telemetri sunucusunun kendi işletim kaydı, sentetik değil |
-| `telemetry.trace` | 2.000.012 span, 87.671'i sentetik işaretli hata |
-| `telemetry.baggage` | 4.500.000 satır — **dokunulmadı** |
-| `telemetry.path` / `path_step` / `trace_path` | dokunulmadı |
+| `telemetry.log` | **6** — telemetri sunucusunun kendi işletim logları |
+| `telemetry.trace` | **12** — sunucunun kendi ClickHouse çağrıları |
+| `telemetry.metric` | 2.470 — **silinmedi**, kaynağı kanıtlanmadı |
+| `telemetry.baggage` | 4.500.000 — **silinmedi**, kullanıcı listesinde yoktu |
+| `telemetry.path` / `path_step` / `trace_path` / `trace_path_step` | **0** |
 
 **Bu veritabanıyla istisna araştırması artık yapılamaz.** Log tablosunda istisna
 kalmadı; hatalı span'lar duruyor ama eşleşen logları yok — yani
