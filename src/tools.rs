@@ -11,6 +11,23 @@ use crate::backends::Backends;
 
 type Result<T> = std::result::Result<T, String>;
 
+/// The source argument for a code-analysis call, or a message saying what is missing.
+///
+/// This crate fetches nothing. `path` is forwarded to tiny-pdg-cs verbatim, which owns
+/// both the analysis and the checkout, so `gh:owner/repo@ref` reaches it unchanged and
+/// the two never disagree about where the code came from. That is only true if nothing
+/// here rewrites the string, so it is returned here and returned unchanged.
+fn code_source<'a>(path: Option<&'a str>, tool: &str, server: &str) -> Result<&'a str> {
+    path.ok_or_else(|| {
+        format!(
+            "{tool} needs `path`: a directory, or gh:owner/repo@ref to fetch one from \
+             GitHub. {server} has no configured source root, so pass it per call. \
+             {server} resolves the specifier and caches the checkout; this server does \
+             not fetch anything itself."
+        )
+    })
+}
+
 // ───────────────────────── investigate_error ─────────────────────────
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -382,6 +399,9 @@ pub struct ExplainMethodArgs {
     /// `Class.Method`, or a bare class name.
     pub target: String,
     /// Directory holding the sources, needed by the code-analysis server.
+    ///
+    /// Or `gh:owner/repo@ref` to have it fetch the repository from GitHub and cache the
+    /// checkout, which is what the code-analysis server does with this value.
     pub path: Option<String>,
 }
 
@@ -428,8 +448,11 @@ pub async fn explain_method(backends: &Arc<Backends>, args: ExplainMethodArgs) -
                 }
             }
         } else {
-            out["sources"]["note"] =
-                json!("pass `path` to enable code-level analysis (callers, PDGs, patterns)");
+            out["sources"]["note"] = json!(
+                "pass `path` to enable code-level analysis (callers, PDGs, patterns): a \
+                 directory, or gh:owner/repo@ref to have the code server fetch it from \
+                 GitHub and cache the checkout"
+            );
         }
     }
 
@@ -444,6 +467,8 @@ pub struct DependenciesArgs {
     /// `Class.Method`.
     pub target: String,
     /// Directory holding the sources, required by the code-analysis server.
+    ///
+    /// Or `gh:owner/repo@ref`, fetched and cached by the code-analysis server.
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -455,13 +480,7 @@ pub async fn method_dependencies(
 ) -> Result<Value> {
     let pdg = backends.pdg_required("method_dependencies")?;
 
-    let path = args.path.as_deref().ok_or_else(|| {
-        format!(
-            "method_dependencies needs `path` (the C# source directory). \
-             {} has no configured source root; pass the directory to analyse.",
-            pdg.name()
-        )
-    })?;
+    let path = code_source(args.path.as_deref(), "method_dependencies", pdg.name())?;
 
     let (class, method) = args.target.split_once('.').ok_or_else(|| {
         format!(
@@ -485,6 +504,8 @@ pub struct HammocksArgs {
     /// `Class.Method`.
     pub target: String,
     /// Directory holding the sources, required by the code-analysis server.
+    ///
+    /// Or `gh:owner/repo@ref`, fetched and cached by the code-analysis server.
     #[serde(default)]
     pub path: Option<String>,
     /// Report only regions with at least this many blocks. 2 is the definition's floor.
@@ -502,13 +523,7 @@ pub struct HammocksArgs {
 pub async fn method_hammocks(backends: &Arc<Backends>, args: HammocksArgs) -> Result<Value> {
     let pdg = backends.pdg_required("method_hammocks")?;
 
-    let path = args.path.as_deref().ok_or_else(|| {
-        format!(
-            "method_hammocks needs `path` (the C# source directory). \
-             {} has no configured source root; pass the directory to analyse.",
-            pdg.name()
-        )
-    })?;
+    let path = code_source(args.path.as_deref(), "method_hammocks", pdg.name())?;
 
     let (class, method) = args.target.split_once('.').ok_or_else(|| {
         format!(
@@ -659,6 +674,38 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_github_specifier_reaches_the_code_server_unchanged() {
+        // The claim this crate makes is that it fetches nothing: `path` goes to
+        // tiny-pdg-cs byte for byte, so the two cannot disagree about where the code came
+        // from. A helper that trimmed, normalised or expanded the string would break that
+        // silently, which is why the pass-through is a function with a test rather than an
+        // argument passed inline.
+        for spec in [
+            "gh:owner/repo",
+            "gh:owner/repo@main",
+            "gh:owner/repo@release/2026-10:Project.API",
+            "./a/local/dir",
+            "/abs/path",
+        ] {
+            assert_eq!(
+                code_source(Some(spec), "method_dependencies", "tiny-pdg-cs").unwrap(),
+                spec,
+                "{spec} must be forwarded verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_source_says_what_to_pass_and_who_fetches_it() {
+        let err = code_source(None, "method_dependencies", "tiny-pdg-cs").unwrap_err();
+        // The message has to carry the shape, or an agent cannot act on it, and it has to
+        // say who does the fetching so nobody expects this server to have done it.
+        assert!(err.contains("gh:owner/repo@ref"), "{err}");
+        assert!(err.contains("does not fetch"), "{err}");
+        assert!(err.contains("method_dependencies"), "{err}");
+    }
 
     #[tokio::test]
     async fn investigate_error_explains_the_missing_backend() {

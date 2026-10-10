@@ -274,7 +274,7 @@ impl RcaServer {
 
     #[tool(
         name = "explain_method",
-        description = "Given Class.Method, report its file and line range, the HTTP endpoints that reach it, and its callers and callees. Use after investigate_error to move from \"this method failed\" to \"what does this method touch\".",
+        description = "Given Class.Method, report its file and line range, the HTTP endpoints that reach it, and its callers and callees. Use after investigate_error to move from \"this method failed\" to \"what does this method touch\". Set path to a directory, or to gh:owner/repo@ref and the code server will fetch the repository from GitHub and cache the checkout, which is what to do when the sources are not on this machine. This server fetches nothing: the specifier is passed through to the code server unchanged.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -294,7 +294,7 @@ impl RcaServer {
 
     #[tool(
         name = "method_dependencies",
-        description = "Program dependence graph for a method: basic blocks with line ranges plus control and data dependences. Use to reason about which statements a failing branch depends on.",
+        description = "Program dependence graph for a method: basic blocks with line ranges plus control and data dependences. Use to reason about which statements a failing branch depends on. Set path to a directory, or to gh:owner/repo@ref and the code server will fetch the repository from GitHub and cache the checkout, which is what to do when the sources are not on this machine. This server fetches nothing: the specifier is passed through to the code server unchanged.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -315,7 +315,7 @@ impl RcaServer {
     /// Nested single-entry, single-exit regions of a method.
     #[tool(
         name = "method_hammocks",
-        description = "Restructure a method into hammock blocks: nested single-entry, single-exit regions, where a loop body sits inside a conditional inside the method. Returns a containment forest, so each region names its parent and its depth — which is what lets a traversal zoom back out after it has gone too deep. Prefer this to method_dependencies when the question is which structured region a symptom falls in: far fewer and larger regions, and the parent link is what a flat PDG cannot give.",
+        description = "Restructure a method into hammock blocks: nested single-entry, single-exit regions, where a loop body sits inside a conditional inside the method. Returns a containment forest, so each region names its parent and its depth — which is what lets a traversal zoom back out after it has gone too deep. Prefer this to method_dependencies when the question is which structured region a symptom falls in: far fewer and larger regions, and the parent link is what a flat PDG cannot give. Set path to a directory, or to gh:owner/repo@ref and the code server will fetch the repository from GitHub and cache the checkout, which is what to do when the sources are not on this machine. This server fetches nothing: the specifier is passed through to the code server unchanged.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
