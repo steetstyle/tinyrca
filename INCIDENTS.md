@@ -11,7 +11,7 @@ adımın sorgusu ile çıktısı kayda işlenir.
 <a id="inc-0001"></a>
 ## INC-0001 — Log deposuna yazılan veri kayboluyor, "depo boş" deniyor
 
-**Durum:** açık — düzeltme sırası bu kayıtta
+**Durum:** düzeltildi (4/4 adım, aşağıda günlük)
 **Tarih:** 2026-10-10
 **Kapsam:** tinylink, tiny-rca
 **Etkilenen araçlar:** `tinylink logs-ingest`, `tiny_rca.search_logs`,
@@ -269,6 +269,73 @@ Düzeltmeyi doğrularken fark edildi. **Ayrı kayıt: [INC-0002](#inc-0002).**
 
 Kısa özet: aynı payload iki kez ingest edildi → **58.694** kayıt, ve araç iki kez
 de "Ingested 29347 record(s)" dedi.
+
+---
+
+#### Adım 4/4 — `praxis_begin` "0 log"un hangisi olduğunu söylesin ✅
+
+**Sorgu (tespit):**
+
+```
+$ grep -n "store_records|logs.len()|log_failures" tinypraxis/src/tools.rs
+149:    let (logs, log_failures) = if args.include_logs {
+182:    let logs_considered = logs.len();
+```
+
+**Sonuç:** `store_records` hiç geçmiyor. `logs_considered: 0` üç farklı bulguyu
+aynı cevapla veriyor: depo hiç doldurulmamış, arama başarısız olmuş, ya da istekler
+gerçekten log yazmamış.
+
+**Değişiklik:** `store_records` `collect_logs`'tan geçirildi ve üç durum ayrı ayrı
+söylendi. `explain_no_logs()` saf fonksiyon — dört durumun hepsi sunucu kurmadan
+test ediliyor.
+
+**Sorgu (boş depo):**
+
+```
+$ tinypraxis serve --rca ... --rca-arg=--index /tmp/opencode/bos-index/...
+$ praxis_begin(trace=real_trace.json, include_logs=true, log_source=store)
+```
+
+**Sonuç:**
+
+```
+logs_considered: 0
+log_source_note : The log store holds 0 records, so `logs_considered: 0` means
+                  nothing was ever ingested rather than that these requests wrote
+                  no logs. Ingest an OTLP payload, or use log_source=database.
+```
+
+**Sorgu (dolu depo, ama trace'e ait log yok):**
+
+```
+$ tinypraxis serve --rca ... --rca-arg=--index ~/.cache/tinylink/unicpeak-analytics.db
+$ praxis_begin(trace=real_trace.json, include_logs=true, log_source=store)
+```
+
+**Sonuç:**
+
+```
+logs_considered: 0
+log_source_note : The store holds 29347 record(s); none belong to these traces.
+                  logs_considered: 0 is a real absence, not an unread store.
+```
+
+**Kabul ölçütü:** aynı sayı, iki farklı ve doğru anlam. Biri "ingest et" der, diğeri
+"yokluğun gerçek, devam et" der. Üçüncü durum (arka uç sayıyı bildirmiyor) ayrıca
+söyleniyor.
+
+---
+
+**Planın tamamı.**
+
+| # | adım | durum |
+|---|---|---|
+| 1 | `capabilities` + `search_logs` depo yolunu bildirsin | ✅ |
+| 2 | boş-depo notu okuduğu yolu söylesin | ✅ |
+| 3 | `logs-ingest` varsayılan çelişkisini söylesin | ✅ |
+| 4 | `praxis_begin` "0 log"un hangisi olduğunu söylesin | ✅ |
+| 3b | ingest yinelenebilirliği → [INC-0002](#inc-0002) | ✅ |
 
 ---
 
