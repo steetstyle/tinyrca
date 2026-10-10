@@ -333,6 +333,27 @@ impl RcaServer {
             .map_err(to_mcp)
     }
 
+    /// Find code on GitHub.
+    #[tool(
+        name = "search_github",
+        description = "Find code on GitHub and get back results you can analyse immediately. `kind` is `repositories` to find a project, or `code` to find files inside them -- code search needs GITHUB_TOKEN and covers the private repositories the token can see as well as the public ones; repository search works without a token. Pass `repository` as owner/name to keep a code search inside one project.\n\nEvery result carries a `specifier`, and a specifier is a `path` argument: pass it to method_pdg, method_hammocks, find_callers, explain_method or diff_impact unchanged. Nothing is needed between finding something and analysing it.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn search_github(
+        &self,
+        args: Parameters<tools::SearchArgs>,
+    ) -> Result<String, McpError> {
+        tools::search_github(&self.backends, args.0)
+            .await
+            .map(render)
+            .map_err(to_mcp)
+    }
+
     /// Compare two versions and list the commits behind the change.
     #[tool(
         name = "diff_impact",
@@ -477,12 +498,13 @@ fn to_mcp(message: String) -> McpError {
 ///
 /// Declared here and asserted against the router rather than written out again in
 /// main.rs, because two hand-maintained lists of the same thing eventually disagree.
-pub const LISTED_TOOLS: [&str; 9] = [
+pub const LISTED_TOOLS: [&str; 10] = [
     "investigate_error",
     "explain_method",
     "method_dependencies",
     "method_hammocks",
     "diff_impact",
+    "search_github",
     "search_logs",
     "ingest_logs",
     "telemetry_call",
@@ -507,6 +529,7 @@ mod tests {
             "method_dependencies",
             "method_hammocks",
             "diff_impact",
+            "search_github",
             "search_logs",
             "ingest_logs",
             "telemetry_call",
@@ -514,7 +537,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 9, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 10, "unexpected tool set: {names:?}");
     }
 
     #[test]

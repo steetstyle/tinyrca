@@ -497,6 +497,50 @@ pub async fn method_dependencies(
     .await
 }
 
+// ───────────────────────── search_github ─────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchArgs {
+    /// A repository name, a topic, or code to find.
+    pub query: String,
+    /// `repositories` to find projects, or `code` to find files inside them.
+    ///
+    /// Code search needs a token; repository search does not.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Keep a code search inside one repository, as `owner/name`.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// How many results, 1 to 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Find code on GitHub and get back results that can be analysed immediately.
+///
+/// Delegates to the code server, which owns the GitHub client. Each result carries a
+/// `specifier`, and a specifier is a source argument -- so finding code and analysing it
+/// takes no step in between.
+///
+/// Reached here rather than only on the code server because an investigation that starts
+/// from "which service is this" needs to find the repository before it can ask anything
+/// about it, and reaching across to a second server for that is one more thing that can
+/// be wired up wrong.
+pub async fn search_github(backends: &Arc<Backends>, args: SearchArgs) -> Result<Value> {
+    let pdg = backends.pdg_required("search_github")?;
+
+    pdg.call(
+        "search_github",
+        json!({
+            "query": args.query,
+            "kind": args.kind,
+            "repository": args.repository,
+            "limit": args.limit,
+        }),
+    )
+    .await
+}
+
 // ───────────────────────── diff_impact ─────────────────────────
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
