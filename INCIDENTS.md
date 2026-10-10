@@ -1049,3 +1049,102 @@ görünmez.
    `telemetry_call` hatası "database unreachable" ayrımını taşımalı; şu anki
    mesaj (`An error occurred invoking 'list_telemetry_scopes'.`) ne ClickHouse'ın
    kapalı olduğunu ne de başka ne söylüyor. Bu madde 3'ten sonra ölçülebilir.
+
+---
+
+## INC-0004'e ek — ClickHouse'a gerek yok, Postgres'te tam telemeti var
+
+**Ölçüm tarihi:** 2026-10-10, düzeltme adımı 3 sırasında
+
+### Konteynerler ve içerikleri
+
+```bash
+$ docker ps --filter ancestor=postgres
+  test_postgres_app        0.0.0.0:5443->5432/tcp   (healthy)
+  test_postgres_analytics  0.0.0.0:5444->5432/tcp   (healthy)
+  test_postgres_logging    0.0.0.0:5445->5432/tcp   (healthy)
+  test_postgres_billing    0.0.0.0:5446->5432/tcp   (healthy)
+```
+
+İlk ölçüm yanıltıcıydı: `information_schema.tables WHERE table_schema='public'`
+sorgusu üç veritabanında "1 tablo" dedi. Tablolar kendi şemalarında —
+`billing.*`, `telemetry.*`, `log.*`. **Genel şema filtresi onları gizliyordu.**
+
+```text
+test_app       public.*            31 tablo   access_token=1085, application=900,
+                                               attribution_configuration=902  (gerçek veri)
+
+test_logging   telemetry.trace             104.595
+               telemetry.metric              91.133
+               telemetry.log                 68.221
+               telemetry.trace_path_step    48.260
+               telemetry.trace_path            394
+               telemetry.baggage                 0
+
+test_billing   billing.credit, billing.credit_transaction, billing.subscription, ...
+```
+
+`schemaversions` dolu (logging'de 31 satır), yani migration'lar koşmuş.
+
+### Telemeti MCP sunucusu Postgres'i destekliyor — kullanılmıyor
+
+`Telemetry.Mcp.Server/Program.cs:145`:
+
+```csharp
+=> Environment.GetEnvironmentVariable("TELEMETRY_MCP_PROVIDER") is { } provider
+   && provider.Equals("postgresql", StringComparison.OrdinalIgnoreCase)
+    ? "PostgreSQL"
+    : "ClickHouse";
+```
+
+`Telemetry.Mcp.Server/Query/PostgresTelemetryQuery.cs` **mevcut**; çalışma
+zamanı ayarları `TELEMETRY_POSTGRESQL_{HOST,PORT,DB,USER,PASSWORD}`
+(`:45-49`).
+
+**Bağlantı ölçüldü ve çalışıyor.** Gerçek istekle:
+
+```text
+TELEMETRY_MCP_PROVIDER=postgresql
+TELEMETRY_POSTGRESQL_HOST=127.0.0.1  PORT=5445  DB=test_logging  USER=test
+-> Npgsql.PostgresException (0x80004005): 42703: column "http_route" does not exist
+```
+
+Yani ClickHouse'ı ayağa kaldırmaya **gerek yok** — hata artık bağlantı değil,
+şema uyuşmazlığı.
+
+### Kapsam: 5 eksik sütun, 108 sütunlu şemada
+
+`PostgresTelemetryQuery.cs` içinde Postgres'te **olmayan** adlar:
+
+| Kodda | Postgres karşılığı | Kanıt |
+|---|---|---|
+| `http_route` | `endpoint` | `telemetry.trace.endpoint` |
+| `service` | `service_name` | `telemetry.trace.service_name` |
+| `path_scope` | `scope_name` | `trace_path.scope_name` |
+| `scope` | `scope_name` / `operation_name` | `trace_path.scope_name`, `telemetry.trace.operation_name` |
+| `route` | `endpoint` | aynı |
+
+Kodun kendi yorumu bile farkında: `// http_route is the stored generated ...`
+— yazar kolonun adını biliyor, şema başka adla üretilmiş.
+
+Bu bir yeniden yazım değil, bir kolon eşlemesi. **Ama `.NET` deposunda** —
+bu dört Rust deposunun hiçbirinde değil.
+
+### İkinci kusur: hata başarılı yanıt olarak dönüyor
+
+```json
+{ "text": "An error occurred invoking 'list_telemetry_scopes'.", "isError": false }
+```
+
+`isError: false`. Yani `PostgresTelemetryQuery` şema hatası verdi, sunucu bunu
+**başarılı cevap** olarak paketledi. tiny-rca'nın `call_for_text`
+(`src/backends.rs:237`) `is_error` alanını doğru okuyor — ama burada `false`,
+ve hata metni düz metin olarak geliyor. Bu, aynı sınıfın üçüncü hatası:
+**başarısızlık, başarı gibi paketlenerek taşınıyor.**
+
+### Kalan iş
+
+1. `PostgresTelemetryQuery`'de 5 kolon adı eşlenmeli (yukarıdaki tablo).
+2. Sunucu `isError: true` dönmeli. Üçüncü madde olmadan birinci doğrulanamaz:
+   hâlâ başarılı görünen bir hata, düzeltilmiş sorgunun da çalışıp
+   çalışmadığını ayırt ettirmez.
