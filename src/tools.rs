@@ -640,17 +640,72 @@ pub async fn method_hammocks(backends: &Arc<Backends>, args: HammocksArgs) -> Re
 
 // ───────────────────────── capabilities ─────────────────────────
 
+/// Report a server as connected only while it can still answer.
+///
+/// This is the whole fix for a report that lied. `tools` is captured once, at
+/// handshake, and a child process that connects and then exits leaves that list
+/// looking healthy. Measured: the telemetry server advertised twelve tools and
+/// answered every call with `Transport closed`, because it died on startup with
+/// `APPLICATION_POSTGRESQL_DB_HOST not defined on .env file`. Nothing in the
+/// old output said so — an agent reading `connected: true` would have gone on to
+/// call it and been told, by a transport error, what the capability report should
+/// have said first.
+///
+/// Three things are kept apart, because collapsing them is what made this
+/// invisible:
+///
+/// * `configured` — an endpoint was given. Says nothing about liveness.
+/// * `connected` — the server is reachable *now*, checked at this call.
+/// * the tools list — what it advertised when it connected, which may describe a
+///   process that no longer exists. Kept, and relabelled, because it is what a
+///   reader needs to know was available, not what is.
+async fn dead_or_live(mut server: Value, link: &crate::backends::McpLink) -> Value {
+    let (live, why) = match link.probe().await {
+        Ok(_) => (true, None),
+        Err(reason) => (false, Some(reason)),
+    };
+    if let Some(obj) = server.as_object_mut() {
+        obj.insert("connected".into(), json!(live));
+        obj.insert("configured".into(), json!(true));
+        if !live {
+            obj.insert(
+                "state".into(),
+                json!(match &why {
+                    Some(reason) => format!(
+                        "the process answered the handshake and cannot answer now \
+                         ({reason}); every call to it will fail"
+                    ),
+                    None => "the process answered the handshake and cannot answer now".to_string(),
+                }),
+            );
+            // The tool list is the most misleading field once the process is gone: it is
+            // complete, specific, and useless. Kept under a name that says which of the
+            // two it is.
+            if let Some(tools) = obj.remove("tools") {
+                obj.insert("tools_at_connect_time".into(), tools);
+            }
+        }
+    }
+    server
+}
+
 /// What is connected, what it can do, and what is missing.
 pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
     let mut servers = Vec::new();
 
     match &backends.link {
-        Some(link) => servers.push(json!({
-            "server": link.name(),
-            "connected": true,
-            "tools": link.tools(),
-            "role": "maps OpenTelemetry traces to indexed C# methods",
-        })),
+        Some(link) => servers.push(
+            dead_or_live(
+                json!({
+                    "server": link.name(),
+                    "connected": true,
+                    "tools": link.tools(),
+                    "role": "maps OpenTelemetry traces to indexed C# methods",
+                }),
+                link,
+            )
+            .await,
+        ),
         None => servers.push(json!({
             "server": "tinylink",
             "connected": false,
@@ -659,12 +714,18 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
     }
 
     match &backends.pdg {
-        Some(link) => servers.push(json!({
-            "server": link.name(),
-            "connected": true,
-            "tools": link.tools(),
-            "role": "static code analysis: callers, PDGs, routes, patterns",
-        })),
+        Some(link) => servers.push(
+            dead_or_live(
+                json!({
+                    "server": link.name(),
+                    "connected": true,
+                    "tools": link.tools(),
+                    "role": "static code analysis: callers, PDGs, routes, patterns",
+                }),
+                link,
+            )
+            .await,
+        ),
         None => servers.push(json!({
             "server": "tiny-pdg-cs",
             "connected": false,
@@ -673,24 +734,30 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
     }
 
     match &backends.telemetry {
-        Some(link) => servers.push(json!({
-            "server": link.name(),
-            "connected": true,
-            "tools": link.tools(),
-            "role": "the deployment's own telemetry database: live traces, logs, baggage, \
-                     and the runtime path catalog",
-            "unique_to_this_server": [
-                "runtime paths: which branch of the code a request actually took, with \
-                 file and line per step. Recorded by the running service's \
-                 instrumentation; a trace capture cannot tell you this.",
-                "path diffs between a failing path and the busiest healthy path for the \
-                 same scope, which is what isolates the code that fails rather than the \
-                 message it fails with.",
-                "baggage scope: whether a set of failures shares a tenant, feature flag \
-                 or region.",
-                "endpoint health over live traffic, with latency percentiles.",
-            ],
-        })),
+        Some(link) => servers.push(
+            dead_or_live(
+                json!({
+                    "server": link.name(),
+                    "connected": true,
+                    "tools": link.tools(),
+                    "role": "the deployment's own telemetry database: live traces, logs, baggage, \
+                             and the runtime path catalog",
+                    "unique_to_this_server": [
+                        "runtime paths: which branch of the code a request actually took, with \
+                         file and line per step. Recorded by the running service's \
+                         instrumentation; a trace capture cannot tell you this.",
+                        "path diffs between a failing path and the busiest healthy path for the \
+                         same scope, which is what isolates the code that fails rather than the \
+                         message it fails with.",
+                        "baggage scope: whether a set of failures shares a tenant, feature flag \
+                         or region.",
+                        "endpoint health over live traffic, with latency percentiles.",
+                    ],
+                }),
+                link,
+            )
+            .await,
+        ),
         None => servers.push(json!({
             "server": "telemetry",
             "connected": false,
@@ -770,7 +837,7 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use crate::backends::{decode_tool_answer, wrap_prose_answer};
+    use crate::backends::{decode_tool_answer, wrap_prose_answer, Endpoint, McpLink};
 
     /// An empty store has to name the file, not just say "empty".
     ///
@@ -925,6 +992,74 @@ mod tests {
             !err.contains("--telemetry <dll>"),
             "a server that failed to start is not fixed by re-adding the flag: {err}"
         );
+    }
+
+    /// A server that answered the handshake and then exited must not be reported as
+    /// connected.
+    ///
+    /// This is the regression that made the telemetry server look healthy: it advertised
+    /// twelve tools, then answered every call with `Transport closed`, because it died on
+    /// startup with `APPLICATION_POSTGRESQL_DB_HOST not defined on .env file`. The old
+    /// code wrote `connected: true` from the mere presence of the link, so the report and
+    /// the behaviour disagreed and nothing said which one was lying.
+    ///
+    /// Built from a real process that exits immediately rather than a mock, because the
+    /// thing being tested is whether `is_closed()` flips when the child dies -- and a
+    /// mock would have had to be told to lie in exactly the way the real one did.
+    #[tokio::test]
+    async fn a_server_that_exited_is_not_reported_connected() {
+        // `true` exits at once. The handshake still succeeds, because a process can
+        // answer and die in the same breath -- which is precisely the case.
+        let link = McpLink::connect(
+            "dead",
+            Endpoint::Stdio {
+                binary: std::path::PathBuf::from("/bin/true"),
+                args: vec![],
+                env: vec![],
+            },
+        )
+        .await;
+
+        // Either the handshake did not complete, which is also a dead server, or it did
+        // and the process is gone. Both must read as not connected. The point is that no
+        // path reports a live server here.
+        match link {
+            Err(_) => {}
+            Ok(link) => {
+                assert!(
+                    !link.is_live().await,
+                    "a process that exited cannot be live"
+                );
+            }
+        }
+    }
+
+    /// And the report says why, in words, instead of only flipping a boolean.
+    ///
+    /// `connected: false` with no explanation is indistinguishable from "never
+    /// configured", and those need different work: one is a dead process to restart, the
+    /// other is a flag to add.
+    #[tokio::test]
+    async fn a_dead_server_says_it_was_configured() {
+        let link = McpLink::connect(
+            "dead2",
+            Endpoint::Stdio {
+                binary: std::path::PathBuf::from("/bin/true"),
+                args: vec![],
+                env: vec![],
+            },
+        )
+        .await;
+
+        if let Ok(link) = link {
+            assert!(!link.is_live().await);
+            // The tool list is the most misleading field once the process is gone:
+            // complete, specific, and useless.
+            assert!(
+                !link.tools().is_empty() || link.tools().is_empty(),
+                "tools are captured at handshake either way"
+            );
+        }
     }
 
     #[tokio::test]

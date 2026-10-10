@@ -868,3 +868,184 @@ kalmadı; hatalı span'lar duruyor ama eşleşen logları yok — yani
   ölçülen şu: `Agency.API.csproj` yalnızca `Rougamo.Fody` referanslı,
   `OpenTelemetry` yalnızca `Infrastructure.Telemetry.Benchmarks` içinde,
   4317/4318 dinleyen yok.
+---
+
+<a id="inc-0004"></a>
+## INC-0004 — `capabilities` telemetry sunucusunu "bağlı" diyor, her çağrı başarısız
+
+**Durum:** kök neden bulundu, düzeltme uygulanmadı (aşağıda)
+**Tarih:** 2026-10-10
+**Kapsam:** tiny-rca, unicpeak-analytics-api (çalıştırma ortamı)
+**Etkilenen araçlar:** `tiny_rca.capabilities`, `tiny_rca.telemetry_call`
+
+---
+
+### Problem
+
+`capabilities` telemetry sunucusunu 12 araçla bağlı gösteriyor. Her
+`telemetry_call` başarısız oluyor:
+
+```json
+{ "server": "telemetry", "connected": true,
+  "tools": ["list_telemetry_scopes", "path_diff", "error_paths", "search_logs",
+            "explain_trace", "new_paths", "capture_coverage", "search_spans",
+            "find_by_baggage", "endpoint_health", "path_profile", "trace_logs"] }
+```
+
+```text
+telemetry_call list_telemetry_scopes -> Error: telemetry server call to
+  'list_telemetry_scopes' failed: Transport closed
+telemetry_call endpoint_health      -> Error: telemetry server call to
+  'endpoint_health' failed: Transport closed
+```
+
+**Kullanıcıya göre telemeti bağlı görünüyor, gerçekte veritabanı erişilemez.**
+
+> **Düzeltme (aynı gün, ölçüm sonrası).** Aşağıdaki 4. maddenin ilk hâlî
+> yanlıştı: "süreç ölmüş" değil. Taze başlatılan bir sunucuda .NET alt süreci
+> **ayakta** ve `tools/list`'e yanıt veriyor, yani `connected: true` doğru. Ölçülen
+> şu:
+>
+> ```text
+> telemetry_call list_telemetry_scopes
+>   -> ERROR: telemetry server reported:
+>      An error occurred invoking 'list_telemetry_scopes'.
+> ```
+>
+> Yani hata **yutulmuyor** — `call_for_text` `is_error`'u doğru okuyor
+> (`src/backends.rs:237`). İlk ölçümüm bunu "Transport closed" gördü ve boş
+> string sandım; aslında hata `result` değil `error` alanında geliyormuş ve benim
+> probe'um onu okumuyordu. **İki ayrı hata vardı** ve ikisi de gerçek:
+>
+> - 2 saat 10 dakika çalışan bir tiny-rca örneğinde .NET alt süreci **gerçekten
+>   ölmüş** (`Transport closed`). Bu ayrı bir durum ve `capabilities` onu
+>   `connected: true` diye bildiriyordu.
+> - Taze başlatılan örnekte süreç yaşıyor, MCP çalışıyor, ama ClickHouse
+>   kapalı olduğu için **her veri sorgusu** hata dönüyor.
+>
+> Gerçek kusur ikincisi ve `capabilities`'ın kapsamı dışında: **"bağlı" demek
+> "veritabanı erişilebilir" demek değil.** Aşağıdaki 4. maddenin düzeltilmiş
+> hâli aşağıda.**
+
+---
+
+### Yeniden üretim
+
+```bash
+# 1. Rapor ne diyor?
+#    MCP: tiny_rca.capabilities  ->  "server": "telemetry", "connected": true, 12 arac
+
+# 2. Ayni sunucuya ilk gercek cagri:
+#    MCP: tiny_rca.telemetry_call(tool="list_telemetry_scopes")  -> "Transport closed"
+```
+
+---
+
+### Kök neden zinciri
+
+Ölçüm, dıştan içe:
+
+**1. `.env` dosyası yok.**
+
+```bash
+$ ls -la .env*
+(bos)
+$ git check-ignore -v .env
+.gitignore:142:.env    .env
+```
+
+Doğru bir karar — sırlar depoda durmamalı — ama dosya hiç oluşturulmamış.
+
+**2. Telemetry sunucusu bu yüzden açılışta ölüyor.**
+
+```bash
+$ dotnet Telemetry.Mcp.Server/bin/Debug/net10.0/Telemetry.Mcp.Server.dll
+  Configuration applied from appsettings.json + appsettings.Development.json (11 keys).
+  Unhandled exception. System.Exception: APPLICATION_POSTGRESQL_DB_HOST not
+  defined on .env file
+     at Shared.Identity.Extensions.SharedApplicationExtension
+        .$Rougamo_AddAuthorizationClient(IServiceCollection services)
+        in Shared.Identity/Extensions/SharedIdentityExtension.cs:line 54
+     at Program.$Rougamo_<Main>$(String[] args) in
+        Telemetry.Mcp.Server/Program.cs:line 105
+```
+
+Beklenen 5 anahtar kodda geçiyor: `APPLICATION_POSTGRESQL_DB_HOST`,
+`_PORT`, `_NAME`, `_USER`, `_PASSWORD`. Kod toplam **78** ortam değişkeni
+okuyor.
+
+**3. API servisleri de çalışmıyor.** Tüm süreç listesi:
+
+```bash
+$ ps aux | grep [d]otnet
+(yalnızca tiny-rca ve tinypraxis MCP sunucuları; hiçbir uygulama süreci yok)
+
+$ ss -ltn
+  8123 yok   (ClickHouse)
+  4317 yok   (OTLP gRPC)
+  4318 yok   (OTLP HTTP)
+  127.0.0.1:11434  (Ollama — tek açık olan)
+
+$ curl -s -o /dev/null -w "%{http_code}" "http://localhost:8123/?query=SELECT%201"
+000
+```
+
+Postgres konteynerleri **ayakta** (`test_postgres_app/logging/analytics/billing`,
+4'er dakikadır `healthy`), yani veritabanı tarafı hazır, uygulama tarafı değil.
+
+**4. Ve asıl kusur: `capabilities` bunu bilmiyor.**
+
+`src/tools.rs:675` — `connected`, sunucu nesnesi var mı diye yazılıyor:
+
+```rust
+match &backends.telemetry {
+    Some(link) => servers.push(json!({
+        "server": link.name(),
+        "connected": true,      // <-- bir cagri yapilmadi
+```
+
+`Backends::connect` (`src/backends.rs:108`) gerçek bir el sıkışma yapıyor ve
+araç listesini o an alıyor. Sonra .NET süreci ölüyor. `capabilities` o anki
+durumu dondurup **bir daha sormuyor**.
+
+Bu, INC-0004'teki ikinci sınıf hata: araç "bağlı" der, kullanıcı çağırır,
+çağrı ölü bir sürece gider, ve bu çökme `capabilities` çıktısında **hiç**
+görünmez.
+
+---
+
+### Etki
+
+- INC-0003'ün açık kalan maddesi ("çalışan servisler enstrümente değil")
+  çözülemez: çalışan servis yok.
+- `path_diff`, `capture_coverage`, `find_by_baggage` — runtime yol kanıtı
+  üreten araçların hepsi erişilemez.
+- `tiny_praxis` telemeti gerektiren adımlarda aynı boşluğa düşer.
+
+---
+
+### Düzeltme sırası (4. madde düzeltildi)
+
+1. ~~`capabilities` bağlantıyı doğrulanmış olarak raporlamalı.~~ **Yapıldı.**
+   `McpLink::probe()` artık gerçek bir `tools/list` turu atıyor ve `capabilities`
+   `connected`'ı o çağrının sonucuna bağlıyor; ayrıca `configured` ve
+   `tools_at_connect_time` alanları eklendi. Ölü alt süreç artık `connected: true`
+   görünmüyor.
+   - İlk deneme `RunningService::is_closed()` idi ve **çalışmadı**: süreç öldükten
+     sonra da `false` döndü. Servis kendi transport'unun kapandığını görmüyor, bu
+     yüzden tuttuğu bir bayrak transport kaybını bildiremez.
+   - Ölü alt süreç senaryosu gerçek: 2 saat 10 dakika çalışan örnekte `Transport
+     closed` ölçüldü. Test `/bin/true` ile kuruluyor, çünkü sınanan şey mock'un
+     yalan söylemesi değil, çocuğun ölünce `is_closed()`'in dönmesi.
+2. **`.env` üretilmeli — ama telemeti sunucusu için gerekli değil.**
+   `.env` eksikliği yalnızca yetkilendirme yolunu (`Shared.Identity`) kırıyor;
+   `TELEMETRY_MCP_TRANSPORT=stdio` verildiğinde sunucu **sorunsuz açılıyor**
+   (ölçüldü). Yani `.env` uygulama servislerini çalıştırmak için gerekli,
+   telemeti okumak için değil.
+3. **ClickHouse ayağa kaldırılmalı.** Şu anki asıl engel bu: sunucu ayakta, MCP
+   çalışıyor, her veri sorgusu hata dönüyor. `curl localhost:8123` → `000`.
+4. **`capabilities`'a veritabanı erişilebilirliği de eklenmeli.** Sırf süreç
+   canlı diye "bağlı" demek, bu ortamda yanlış olumlu veriyor. En azından
+   `telemetry_call` hatası "database unreachable" ayrımını taşımalı; şu anki
+   mesaj (`An error occurred invoking 'list_telemetry_scopes'.`) ne ClickHouse'ın
+   kapalı olduğunu ne de başka ne söylüyor. Bu madde 3'ten sonra ölçülebilir.

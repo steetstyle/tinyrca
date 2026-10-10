@@ -252,6 +252,45 @@ impl McpLink {
         &self.tools
     }
 
+    /// Whether the server is still there right now, by asking it.
+    ///
+    /// The tool list is captured once, at handshake. A child process that connected and
+    /// then exited leaves that list looking perfectly healthy -- measured: the telemetry
+    /// server advertised twelve tools, then answered every call with `Transport closed`,
+    /// because it died on startup with `APPLICATION_POSTGRESQL_DB_HOST not defined on
+    /// .env file`. Anything reporting "connected" from the stored list is reporting
+    /// history, not state.
+    pub async fn is_live(&self) -> bool {
+        self.probe().await.is_ok()
+    }
+
+    /// Ask the server whether it is still there, and how long to wait for the answer.
+    ///
+    /// A real round trip, because nothing cheaper is truthful.
+    ///
+    /// `RunningService::is_closed()` was the first attempt and it does not work: measured
+    /// with the telemetry server dead, the flag stayed `false` indefinitely after the
+    /// child exited. The service does not observe its own transport ending, so a flag it
+    /// maintains cannot report that it lost its transport. `tools/list` is the same
+    /// request the handshake makes, and a process that cannot answer it cannot answer
+    /// anything else either.
+    ///
+    /// The timeout is what turns a hung server into an answer. Without it a
+    /// capabilities call blocks for as long as the server stays silent, which is the same
+    /// class of failure as not answering at all.
+    pub async fn probe(&self) -> Result<usize, String> {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.service.list_all_tools(),
+        )
+        .await
+        {
+            Ok(Ok(tools)) => Ok(tools.len()),
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(_) => Err("no answer within 3s".to_string()),
+        }
+    }
+
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.iter().any(|t| t == name)
     }
