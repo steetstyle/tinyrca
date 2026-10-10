@@ -721,6 +721,10 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
         "can_map_traces_to_code": backends.link.is_some(),
         "can_analyse_code": backends.pdg.is_some(),
         "can_search_logs": can_search_logs,
+        // Which file the OTLP store is, and whether anything is in it. Said here because
+        // the store path is derived rather than configured, so an empty search is
+        // ambiguous without it -- and because nothing else names the file.
+        "log_store": log_store_report(backends).await,
         "can_search_database_logs": can_search_database_logs,
         "can_resolve_runtime_paths": backends.telemetry.is_some(),
         // Said up front because it is the step most likely to be missing: traces
@@ -767,6 +771,38 @@ pub async fn capabilities(backends: &Arc<Backends>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use crate::backends::{decode_tool_answer, wrap_prose_answer};
+
+    /// An empty store has to name the file, not just say "empty".
+    ///
+    /// Measured: 29,347 records ingested, answer said "The log store is empty",
+    /// because the payload had gone to a different file. Nothing in the response said
+    /// which file this server reads, so the records looked lost rather than misplaced.
+    /// Two failures from one message -- "no logs" and "wrong file" lead to opposite
+    /// conclusions, and only one of them is a re-ingest.
+    #[test]
+    fn an_empty_store_names_the_file_it_read() {
+        let note = super::empty_store_note(Some("/home/x/.cache/tinylink/agency.logs.db"));
+        assert!(
+            note.contains("agency.logs.db"),
+            "the path has to be in it: {note}"
+        );
+        assert!(
+            note.contains("different file"),
+            "it has to say why the answer might be empty: {note}"
+        );
+    }
+
+    /// And when the backend cannot say where its store is, say that instead of
+    /// pretending the question was never asked.
+    #[test]
+    fn an_empty_store_without_a_known_path_says_so() {
+        let note = super::empty_store_note(None);
+        assert!(!note.contains("/"), "no invented path: {note}");
+        assert!(
+            note.contains("did not report which file"),
+            "it has to admit the gap: {note}"
+        );
+    }
 
     /// A search that matched nothing must come back as an empty result set, not as a
     /// transport failure.
@@ -1157,17 +1193,69 @@ async fn search_logs_in_store(backends: &Arc<Backends>, args: SearchLogsArgs) ->
     insert("offset", args.offset.map(|v| json!(v)));
 
     let mut out = link.call("search_logs", Value::Object(payload)).await?;
+    let store_path = out["log_store"]["path"].as_str().map(str::to_string);
+    let store_records = out["store_records"].clone();
     out["source"] = json!("store");
+
     // Say plainly when the store holds nothing, because "no logs found" and "logs
-    // were never ingested" lead to opposite conclusions.
-    if out["store_records"] == json!(0) {
-        out["note"] = json!(
-            "The log store is empty. Ingest OTLP payloads with `tinylink logs-ingest <path>` \
-             or the tinylink ingest_logs tool before searching, or use \
-             source=database for the deployment's own logs."
-        );
+    // were never ingested" lead to opposite conclusions -- and, more importantly, name
+    // the file this server actually read.
+    //
+    // Measured: 29,347 records ingested, and this answer said "The log store is empty",
+    // because the payload had gone to a different file and nothing said which one this
+    // server looks at. A wrong file is recoverable; a message that says "empty" is not.
+    if store_records == json!(0) {
+        out["note"] = json!(empty_store_note(store_path.as_deref()));
     }
     Ok(out)
+}
+
+/// The note for a store that holds nothing.
+///
+/// Split out so it can be tested without a server, which is the only way to test it
+/// honestly -- the failure this fixes is a message, and a message needs a test more
+/// than most code does.
+fn empty_store_note(store_path: Option<&str>) -> String {
+    match store_path {
+        Some(path) => format!(
+            "The log store at {path} holds no records. Ingest with `tinylink logs-ingest \
+             <path>` or the tinylink ingest_logs tool -- writing to a different file will \
+             not show up here, because the store path is derived from the index path \
+             unless TINYLINK_LOG_STORE says otherwise. Use source=database for the \
+             deployment's own logs."
+        ),
+        None => "The log store is empty, and the tinylink server did not report which file \
+                 it reads, so the store may be elsewhere. Ingest OTLP payloads with \
+                 `tinylink logs-ingest <path>` or the tinylink ingest_logs tool before \
+                 searching, or use source=database for the deployment's own logs."
+            .to_string(),
+    }
+}
+
+/// Ask the tinylink backend which log file it reads and how much is in it.
+///
+/// One probe, and only when log search is available at all: the answer decides whether
+/// an empty result means "no logs" or "wrong file", which is the difference between
+/// ingesting once and ingesting repeatedly.
+async fn log_store_report(backends: &Arc<Backends>) -> Value {
+    let Some(link) = backends.link.as_ref() else {
+        return json!({ "known": false, "why": "no tinylink server" });
+    };
+    if !link.has_tool("search_logs") {
+        return json!({ "known": false, "why": "the tinylink server has no search_logs" });
+    }
+
+    match link.call("search_logs", json!({ "limit": 1 })).await {
+        Ok(out) => json!({
+            "known": true,
+            "path": out["log_store"]["path"].clone(),
+            "records": out["store_records"].clone(),
+            "derived_from": out["log_store"]["derived_from"].clone(),
+            "note": "Ingest with tinylink logs-ingest, or this server's ingest_logs. \
+                     Anything written to another file is invisible here.",
+        }),
+        Err(message) => json!({ "known": false, "why": message }),
+    }
 }
 
 /// Search the telemetry database the running services write to.
