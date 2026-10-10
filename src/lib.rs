@@ -333,6 +333,27 @@ impl RcaServer {
             .map_err(to_mcp)
     }
 
+    /// Compare two versions and list the commits behind the change.
+    #[tool(
+        name = "diff_impact",
+        description = "Compare two versions of a codebase: what changed, which of those changes reach further, and the commits between the two versions with their messages. Give both arguments as gh:owner/repo@ref and the answer comes back with the commit list -- sha, subject and body, author, date -- because a caller that disappeared is a fact and the commit that removed it is the explanation.\n\nPass a branch and a commit, or a commit and its parent. Local directories also work and give the call-graph diff, but no history: they answer \"what changed\", not \"why\". `class` and `method` narrow the impact graph to one target; omit them and every changed method is traced, capped at 25 targets and reported as capped.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn diff_impact(
+        &self,
+        args: Parameters<tools::DiffImpactArgs>,
+    ) -> Result<String, McpError> {
+        tools::diff_impact(&self.backends, args.0)
+            .await
+            .map(render)
+            .map_err(to_mcp)
+    }
+
     /// Search the log store.
     #[tool(
         name = "search_logs",
@@ -469,6 +490,7 @@ mod tests {
             "explain_method",
             "method_dependencies",
             "method_hammocks",
+            "diff_impact",
             "search_logs",
             "ingest_logs",
             "telemetry_call",
@@ -476,7 +498,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 8, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 9, "unexpected tool set: {names:?}");
     }
 
     #[test]

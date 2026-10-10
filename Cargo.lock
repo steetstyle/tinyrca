@@ -1647,7 +1647,7 @@ dependencies = [
 [[package]]
 name = "tiny-pdg-cs"
 version = "0.1.0"
-source = "git+https://github.com/steetstyle/tinypdg-cs.git#0b932026dda7ec4c31a4a1c1e3fef1b1211175a7"
+source = "git+https://github.com/steetstyle/tinypdg-cs.git#39a9d5f8177c237dd8e9f42eaf9bf73ff240f448"
 dependencies = [
  "anyhow",
  "clap",

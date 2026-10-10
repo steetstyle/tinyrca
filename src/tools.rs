@@ -497,6 +497,55 @@ pub async fn method_dependencies(
     .await
 }
 
+// ───────────────────────── diff_impact ─────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DiffImpactArgs {
+    /// The version before the change: a directory, or `gh:owner/repo@ref`.
+    ///
+    /// Two repository references are what make the commit list meaningful; two local
+    /// directories give a call-graph diff with no history behind it.
+    pub from: String,
+    /// The version under suspicion, in the same form.
+    pub to: String,
+    /// Narrow the impact graph to one class.
+    #[serde(default)]
+    pub class: Option<String>,
+    /// Narrow the impact graph to one method.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Report only methods that lost a caller, which is the default.
+    #[serde(default)]
+    pub only_lost_callers: Option<bool>,
+    /// How many changed methods to list.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Compare two versions of a codebase: what changed, what it reaches, and which commits
+/// are behind the change.
+///
+/// Delegates to the code server, which owns both the analysis and the checkout. Both
+/// arguments may be `gh:` references, and that is the form worth using: the answer then
+/// carries the commits between the two versions with their messages, which is what
+/// turns "these callers disappeared" into "this commit did it".
+pub async fn diff_impact(backends: &Arc<Backends>, args: DiffImpactArgs) -> Result<Value> {
+    let pdg = backends.pdg_required("diff_impact")?;
+
+    pdg.call(
+        "diff_impact",
+        json!({
+            "path_v1": args.from,
+            "path_v2": args.to,
+            "class": args.class,
+            "method": args.method,
+            "only_lost_callers": args.only_lost_callers,
+            "limit": args.limit,
+        }),
+    )
+    .await
+}
+
 // ───────────────────────── method_hammocks ─────────────────────────
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
