@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # No branch filter. The previous one said `branches: [main]` while this repository's
+  # branch is `master`, so the workflow had never run -- not once, on any push, and it
+  # is registered as active so nothing looked wrong. A gate that has never executed is
+  # worse than no gate: it reads as a passing check in the UI.
   push:
-    branches: [main]
   pull_request:
 
 env:
