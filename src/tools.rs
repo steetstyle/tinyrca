@@ -1036,8 +1036,10 @@ pub async fn telemetry_call(backends: &Arc<Backends>, args: TelemetryCallArgs) -
             names.join(", ")
         ));
     }
+    // call_raw, not call: the telemetry server's tools answer in prose when there is
+    // nothing to report, and treating that as a transport failure loses the answer.
     telemetry
-        .call(&args.tool, Value::Object(args.arguments))
+        .call_raw(&args.tool, Value::Object(args.arguments))
         .await
 }
 

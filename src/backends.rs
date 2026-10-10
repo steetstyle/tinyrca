@@ -195,6 +195,55 @@ impl McpLink {
         .await
     }
 
+    /// Call a tool and return whatever it answered with, JSON or not.
+    ///
+    /// For passthroughs, whose tools are not required to answer in JSON. Use [`call`] for a
+    /// tool of this server's own, where a non-JSON answer is a real fault.
+    pub async fn call_raw(&self, tool: &str, args: Value) -> Result<Value, String> {
+        let text = self.call_for_text(tool, args).await?;
+        Ok(decode_tool_answer(text.clone()).unwrap_or_else(|_| wrap_prose_answer(text)))
+    }
+
+    /// The text a tool answered with, without deciding what shape it is in.
+    async fn call_for_text(&self, tool: &str, args: Value) -> Result<String, String> {
+        if !self.has_tool(tool) {
+            return Err(format!(
+                "{} server has no tool '{tool}'. It offers {} tool(s)",
+                self.name,
+                self.tools.len()
+            ));
+        }
+
+        let result = self
+            .service
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new(tool.to_string())
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await
+            .map_err(|e| format!("{} server call to '{tool}' failed: {e}", self.name))?;
+
+        let text = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .next()
+            .ok_or_else(|| format!("{} server returned no text content", self.name))?
+            .to_string();
+
+        if result.is_error.unwrap_or(false) {
+            return Err(format!("{} server reported: {}", self.name, text));
+        }
+        Ok(text)
+    }
+
+    // `call` keeps its own body rather than sharing with `call_raw`. The duplication is
+    // four lines of protocol, and the alternative is one function with a flag that means
+    // two different things to its caller.
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -265,6 +314,35 @@ impl McpLink {
             )
         })
     }
+}
+
+/// Turn a tool's text answer into a value, or say why it cannot.
+///
+/// Split out from the two callers so it can be tested without a server: the decision is
+/// "is this JSON or not", and that is the whole of what differs between them.
+fn decode_tool_answer(text: String) -> Result<Value, String> {
+    serde_json::from_str(&text).map_err(|e| {
+        let head: String = text.chars().take(200).collect();
+        format!(
+            "returned non-JSON: {e}. First bytes: {}",
+            if head.is_empty() { "<empty>" } else { &head }
+        )
+    })
+}
+
+/// Wrap a prose answer so the caller still gets one shape, and say that is what happened.
+///
+/// A passthrough forwards another server's tools verbatim, and those tools answer in
+/// prose when there is nothing to report -- `endpoint_health` returns "No rows matched:
+/// routes with at least 20 requests ..." for an empty result. That is a correct answer,
+/// and requiring JSON turns it into a failure that reads like a transport problem and
+/// points whoever is reading it at the wrong thing.
+fn wrap_prose_answer(text: String) -> Value {
+    serde_json::json!({
+        "text": text,
+        "note": "this tool answered in prose rather than JSON, and it is passed through \
+                 unchanged. The text above is the answer, not an error.",
+    })
 }
 
 /// Initialize a transport and list its tools, with a timeout.
@@ -424,6 +502,56 @@ mod tests {
             .err()
             .expect("no pdg backend configured");
         assert!(err.contains("tiny-pdg-cs"), "{err}");
+    }
+
+    /// A passthrough must not turn a prose answer into a transport failure.
+    ///
+    /// `endpoint_health` answers "No rows matched: routes with at least 20 requests ..."
+    /// when there is nothing to report. That is the correct answer, and it was arriving
+    /// as an error naming JSON -- which points whoever is reading it at the transport
+    /// instead of at the empty result.
+    #[test]
+    fn a_prose_answer_is_passed_through_with_a_note() {
+        let answer = "No rows matched: routes with at least 20 requests in the last 1440 minutes.";
+        let value = wrap_prose_answer(answer.to_string());
+
+        assert_eq!(value["text"], answer);
+        let note = value["note"].as_str().expect("the wrapper explains itself");
+        assert!(note.contains("prose"), "{note}");
+        assert!(
+            note.contains("not an error"),
+            "a caller must not read the wrapper as a failure: {note}"
+        );
+    }
+
+    /// The same text through the JSON path is still an error, because a tool of this
+    /// server's own that promises JSON and does not deliver it is a different fault.
+    #[test]
+    fn a_prose_answer_is_still_a_failure_for_a_json_caller() {
+        let err = decode_tool_answer("No rows matched: ...".to_string())
+            .expect_err("a JSON caller must not accept prose");
+        assert!(err.contains("non-JSON"), "{err}");
+        // And it quotes what came back, because "expected value at line 1 column 1" on its
+        // own says nothing about what was actually said.
+        assert!(err.contains("No rows matched"), "{err}");
+    }
+
+    #[test]
+    fn a_json_answer_passes_through_unchanged() {
+        let value =
+            decode_tool_answer(r#"{"total":3,"items":[]}"#.to_string()).expect("JSON is JSON");
+        assert_eq!(value["total"], 3);
+        assert!(
+            value.get("note").is_none(),
+            "no wrapper when none is needed"
+        );
+    }
+
+    /// An empty answer is a fault, not prose to be passed along.
+    #[test]
+    fn an_empty_answer_is_reported_as_empty() {
+        let err = decode_tool_answer(String::new()).expect_err("empty is not a value");
+        assert!(err.contains("<empty>"), "{err}");
     }
 
     #[tokio::test]
