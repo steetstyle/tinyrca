@@ -31,31 +31,37 @@ jobs:
       # The backends are separate crates in sibling directories; tiny-rca's
       # integration test drives the real binaries, so it needs release builds of
       # both. Checkout them alongside.
-      # Siblings, not subdirectories. Cargo.toml points at `../tinylink`, because that
-      # is where it sits locally; checking the two repositories out *inside* the crate
-      # put tinylink at <workspace>/tinylink while cargo looked in <workspace>/../tinylink,
-      # and the build stopped with "no matching package named `tinylink` found".
+      # Checked out beside the crate rather than inside it, because Cargo.toml points at
+      # `../tinylink` -- that is where it sits locally, and matching the local layout is
+      # what lets the integration test drive the same binaries a developer does.
       #
-      # Matching the local layout also means the integration test drives the binaries the
-      # same way a developer does.
+      # actions/checkout refuses to write outside the workspace ("Repository path is not
+      # under <workspace>"), so the siblings are linked rather than cloned. Without the
+      # link the build stops with "no matching package named `tinylink` found".
       - name: Check out tiny-pdg-cs
         uses: actions/checkout@v4
         with:
           repository: steetstyle/tinypdg-cs
-          path: ../tiny-pdg-cs
+          path: tiny-pdg-cs
 
       - name: Check out tinylink
         uses: actions/checkout@v4
         with:
           repository: steetstyle/tinylink
-          path: ../tinylink
+          path: tinylink
+
+      - name: Put the siblings where Cargo looks for them
+        run: |
+          ln -s "$GITHUB_WORKSPACE/tinylink" "$GITHUB_WORKSPACE/../tinylink"
+          ln -s "$GITHUB_WORKSPACE/tiny-pdg-cs" "$GITHUB_WORKSPACE/../tiny-pdg-cs"
+          ls -l "$GITHUB_WORKSPACE/../"
 
       - name: Build tiny-pdg-cs
-        working-directory: ../tiny-pdg-cs
+        working-directory: tiny-pdg-cs
         run: cargo build --release --features mcp
 
       - name: Build tinylink
-        working-directory: ../tinylink
+        working-directory: tinylink
         # mcp-http, not mcp: tests/http_test.rs drives `tinylink serve --http` as a
         # shared backend, and that transport is behind its own feature. With only
         # `mcp` the binary answers "serve --http requires the mcp-http feature" and the
