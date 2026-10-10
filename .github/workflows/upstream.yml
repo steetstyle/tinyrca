@@ -1,0 +1,128 @@
+name: Upstream
+
+# Cargo.lock pins tiny-pdg-cs to a commit, so a change pushed there is invisible here
+# until someone runs `cargo update -p tiny-pdg-cs`. That has already cost a silent
+# failure in this stack: a feature that existed and did not work, because this crate was
+# built against the older revision and quietly did the old thing.
+#
+# So this builds against the latest rather than the pinned one. Two outcomes, and they
+# are not the same:
+#
+#   the build or the tests fail   tiny-pdg-cs changed in a way that breaks this crate.
+#                                  A real failure, and it belongs on the commit that
+#                                  caused it.
+#   they pass but Cargo.lock moved  tiny-pdg-cs moved on. Not broken, just not current,
+#                                  and what users get is not what was just tested.
+#
+# On a schedule, so the second surfaces without anyone having to push here first.
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+  push:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  upstream:
+    name: against the latest tiny-pdg-cs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Move the pin forward
+        id: update
+        run: |
+          set -uo pipefail
+          # Not `-e`: the failure modes below have to be told apart, and `set -e` would
+          # end the step on the first one without saying which it was.
+          if ! cargo update -p tiny-pdg-cs 2>update.err; then
+            echo "could not reach the tiny-pdg-cs repository" >&2
+            cat update.err >&2
+            echo "state=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The revision the rest of the job must use, taken from the lock rather than
+          # from main. The integration tests drive real binaries, and checking those out
+          # at a different revision than the one compiled in would test a combination
+          # that does not exist -- and would pass or fail for reasons the log does not
+          # explain.
+          SHA=$(grep -A 2 'name = "tiny-pdg-cs"' Cargo.lock | grep -oE '[0-9a-f]{40}' | head -1)
+          if [ -z "$SHA" ]; then
+            echo "::error::could not read the tiny-pdg-cs revision from Cargo.lock"
+            echo "state=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          if git diff --quiet -- Cargo.lock; then
+            echo "state=current" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=stale" >> "$GITHUB_OUTPUT"
+            git diff -U0 -- Cargo.lock | grep -E '^[+-].*tiny-pdg-cs' || true
+          fi
+
+      # Checked out at the revision the lock names, not at the default branch. See above.
+      - name: Check out tiny-pdg-cs at the pinned revision
+        if: steps.update.outputs.state != 'unknown'
+        uses: actions/checkout@v4
+        with:
+          repository: steetstyle/tinypdg-cs
+          ref: ${{ steps.update.outputs.sha }}
+          path: tiny-pdg-cs
+
+      - name: Check out tinylink
+        if: steps.update.outputs.state != 'unknown'
+        uses: actions/checkout@v4
+        with:
+          repository: steetstyle/tinylink
+          path: tinylink
+
+      - name: Build tiny-pdg-cs
+        if: steps.update.outputs.state != 'unknown'
+        working-directory: tiny-pdg-cs
+        run: cargo build --release --features mcp
+
+      - name: Build tinylink
+        if: steps.update.outputs.state != 'unknown'
+        working-directory: tinylink
+        # mcp-http, not mcp: tests/http_test.rs drives `tinylink serve --http` as a
+        # shared backend, and that transport is behind its own feature.
+        run: cargo build --release --features mcp-http
+
+      # Skipped rather than faked when the pin could not be moved: reporting an upstream
+      # failure that is really a network failure sends the reader after the wrong thing.
+      - name: fmt
+        if: steps.update.outputs.state != 'unknown'
+        run: cargo fmt --all --check
+
+      - name: clippy
+        if: steps.update.outputs.state != 'unknown'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        if: steps.update.outputs.state != 'unknown'
+        run: cargo test
+
+      - name: Report the state of the pin
+        if: always()
+        run: |
+          case "${{ steps.update.outputs.state }}" in
+            current)
+              echo "Cargo.lock already pins the latest tiny-pdg-cs (${{ steps.update.outputs.sha }}), so the build above tested what users get." ;;
+            stale)
+              echo "::error::Cargo.lock pins an older tiny-pdg-cs than main, so the build above tested code nobody gets. Run: cargo update -p tiny-pdg-cs, then commit Cargo.lock." ;;
+            *)
+              echo "::warning::could not verify the tiny-pdg-cs pin; nothing was verified." ;;
+          esac
