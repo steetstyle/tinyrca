@@ -473,6 +473,22 @@ fn to_mcp(message: String) -> McpError {
     McpError::invalid_params(message, None)
 }
 
+/// The tool names `tiny-rca tools` prints.
+///
+/// Declared here and asserted against the router rather than written out again in
+/// main.rs, because two hand-maintained lists of the same thing eventually disagree.
+pub const LISTED_TOOLS: [&str; 9] = [
+    "investigate_error",
+    "explain_method",
+    "method_dependencies",
+    "method_hammocks",
+    "diff_impact",
+    "search_logs",
+    "ingest_logs",
+    "telemetry_call",
+    "capabilities",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +536,58 @@ mod tests {
                 tool.name
             );
             assert!(tool.description.as_deref().unwrap().len() > 40);
+        }
+    }
+
+    /// `tiny-rca tools` and the router must list the same tools.
+    ///
+    /// They are written out separately, so they can disagree, and they did:
+    /// `diff_impact` reached the router and the test asserting nine tools passed while
+    /// the CLI listed eight. The listing is what a reader consults to find out what to
+    /// point an MCP client at, so a tool missing from it is a tool nobody finds.
+    #[test]
+    fn the_command_line_listing_matches_the_router() {
+        let from_router: std::collections::BTreeSet<String> = RcaServer::tool_router()
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        let from_cli: std::collections::BTreeSet<String> =
+            LISTED_TOOLS.iter().map(|t| t.to_string()).collect();
+
+        assert_eq!(
+            from_router, from_cli,
+            "`tiny-rca tools` and the MCP router disagree"
+        );
+    }
+
+    /// Every tool must say whether it writes, because a client that gates approvals on
+    /// the annotation has nothing else to go on.
+    #[test]
+    fn tools_say_whether_they_change_anything() {
+        // ingest_logs writes to the log store; diff_impact and the rest only read, and
+        // diff_impact only reads because the repositories it fetches are cached -- a
+        // fetch is a write to a cache directory, not to anything a caller owns.
+        const WRITES: [&str; 1] = ["ingest_logs"];
+
+        let router = RcaServer::tool_router();
+        for tool in router.list_all() {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+            assert_eq!(
+                annotations.read_only_hint,
+                Some(!WRITES.contains(&tool.name.as_ref())),
+                "{}",
+                tool.name
+            );
+            assert!(
+                tool.description.as_deref().unwrap().len() > 40,
+                "{}",
+                tool.name
+            );
         }
     }
 

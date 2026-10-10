@@ -37,16 +37,7 @@ fn main() {
     let result = match cli.command {
         Commands::Serve(args) => serve(args),
         Commands::Tools => {
-            for name in [
-                "investigate_error",
-                "explain_method",
-                "method_dependencies",
-                "method_hammocks",
-                "search_logs",
-                "ingest_logs",
-                "telemetry_call",
-                "capabilities",
-            ] {
+            for name in tiny_rca::LISTED_TOOLS {
                 println!("{name}");
             }
             Ok(())
